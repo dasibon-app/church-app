@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 보안 문제 (비공개로 알려 주세요)
+    url: https://github.com/dasibon-app/church-app/security/advisories/new
+    about: 자료 유출·권한 문제는 공개 Issue로 올리지 마세요.

@@ -1,0 +1,19 @@
+name: 설치·업데이트가 안 돼요
+description: Claude에 올리는 단계에서 막혔습니다
+labels: [install]
+body:
+  - type: markdown
+    attributes:
+      value: 설치 방법은 시험 중입니다. 막힌 곳을 알려 주시면 안내를 고치겠습니다. 성도 정보가 보이는 화면은 올리지 마세요.
+  - type: input
+    id: plan
+    attributes:
+      label: Claude 요금제 (Pro, Max, Team 등)
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: 어디까지 되었고 어디서 막혔나요? (Claude가 한 답도 적어 주세요)
+    validations:
+      required: true

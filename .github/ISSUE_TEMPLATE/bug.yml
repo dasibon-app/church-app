@@ -1,0 +1,24 @@
+name: 오류 신고
+description: 앱이 이상하게 동작합니다
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **성도 이름, 연락처, 주민등록번호, 헌금 내역이 보이는 화면은 올리지 마세요.** 가리거나 예시 자료로 재현해 주세요.
+  - type: input
+    id: version
+    attributes:
+      label: 앱 버전 (설정 → 앱 정보)
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: 어느 화면에서 무엇을 눌렀더니 어떻게 되었나요?
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: 컴퓨터/휴대폰, 브라우저
