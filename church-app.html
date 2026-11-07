@@ -283,7 +283,7 @@ const FY = {
 const ymKey = (y, m) => `${y}-${pad(m)}`;
 
 /* ========== 기본 설정 ========== */
-const APP_VERSION = "1.1.0", APP_DATE = "2026-11-07", APP_EDITION = "구독자 배포판";
+const APP_VERSION = "1.1.1", APP_DATE = "2026-11-07", APP_EDITION = "구독자 배포판";
 const MAKER = { church: "다시본교회", pastor: "주진규 목사", home: "https://dasibon.icg21.com/", bulletin: "https://dasibon-church.jinkyuju.workers.dev/", youtube: "https://www.youtube.com/@dasibon", releases: "https://github.com/dasibon-app/church-app/releases/latest" };
 const makerHtml = () => `<b>${MAKER.church}</b> ${MAKER.pastor}가 작은 교회를 위해 만들어 무료로 나눕니다.<br>
   <a href="${MAKER.home}" target="_blank" rel="noopener noreferrer">교회 홈페이지</a> · <a href="${MAKER.bulletin}" target="_blank" rel="noopener noreferrer">웹주보</a> · <a href="${MAKER.youtube}" target="_blank" rel="noopener noreferrer">유튜브</a>`;
@@ -508,7 +508,7 @@ const ST = () => S.settings;
 const fmtAt = iso => { try { return new Date(iso).toLocaleString("ko-KR", { timeZone: "Asia/Seoul", year: "numeric", month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false }); } catch (e) { return ""; } };
 const Lock = {
   closed(d) { const c = (S.closing || {})[lastSunday(d)]; return !!(c && c.closed); },
-  offFp(doc) { return ((doc && doc.entries) || []).map(e => (e.id || "") + ":" + rowTotal(e)).sort().join(","); },
+  offFp(doc) { return ((doc && doc.entries) || []).map(e => (e.id || "") + ":" + rowTotal(e) + ":" + (e.pay === "t" ? "t" : "c")).sort().join(","); },
   expMap(doc) { const o = {}; for (const e of (doc && doc.items) || []) o[e.id] = [e.date, +e.amount || 0, e.itemId || ""].join("|"); return o; },
   /* 마감된 주의 기록이 달라지는 저장이면 그 날짜를 돌려준다. 이름·메모만 바뀌는 저장(종류 이름 변경, 성도 합치기 등)은 통과 */
   check(c, id, next) {
@@ -796,6 +796,8 @@ function absentees(n) {
 
 /* ========== 주간 마감 화면 ========== */
 const wkRows = w => offeringRows(w, addDays(w, 6));
+/* 입금 형태: 줄(entry)의 pay 가 "t" 이면 계좌이체, 없으면 현장(현금) */
+const payTotals = rows => { let cash = 0, tr = 0; for (const e of rows) { if (e.pay === "t") tr += rowTotal(e); else cash += rowTotal(e); } return { cash, tr }; };
 const wkTotal = w => wkRows(w).reduce((s, e) => s + rowTotal(e), 0);
 const CL = { all: false };
 Views.closing = () => {
@@ -807,37 +809,34 @@ Views.closing = () => {
       <div class="s">${fmtMD(w)} ~ ${fmtMD(addDays(w, 6))} · 헌금 ${wonU(tot)} · 지출 ${exN}건${c && (c.log || []).some(x => x.act === "reopen") ? " · 해제 이력 있음" : ""}</div></div><span class="chev">›</span></div>`;
   }).join("");
   return topBar("주간 마감", "헌금 계수를 맞춰 본 뒤, 그 주의 헌금·지출을 잠급니다") + banner() +
-    `<div class="card" style="margin-bottom:14px"><div class="hint">주일부터 토요일까지 한 주를 기준으로 합니다. ① 기록된 헌금 합계 = 현금 + 직접 입금(계좌이체), ② 현금 = 은행 입금 + 교회 보관 현금 이 모두 맞아야 마감됩니다. <b>마감하면 그 주의 헌금·지출은 고칠 수 없고</b>, 고쳐야 할 때는 사유를 남기고 해제합니다. 해제·재마감 이력은 남습니다.</div></div>` +
+    `<div class="card" style="margin-bottom:14px"><div class="hint">주일부터 토요일까지 한 주를 기준으로 합니다. 헌금 입력의 ‘입금 형태’(현장·계좌이체)별 합계가 자동으로 채워지고, 봉투를 센 현금과 통장의 이체 내역이 같은지 확인하면 마감됩니다. <b>마감하면 그 주의 헌금·지출은 고칠 수 없고</b>, 고쳐야 할 때는 사유를 남기고 해제합니다. 해제·재마감 이력은 남습니다.</div></div>` +
     (rows ? `<div class="list">${rows}</div>${list.length > shown.length ? `<div class="mt"><button class="btn" onclick="CL.all=true;App.render()">이전 주 모두 보기 (${list.length}주)</button></div>` : ""}` : `<div class="card empty"><div class="e">🔒</div>아직 입력된 헌금이 없습니다.</div>`);
 };
 const ClosingUI = {
   open(w) {
-    const c = S.closing[w] || {}, cl = !!c.closed, tot = wkTotal(w), dates = [...new Set(wkRows(w).map(e => e.date))].sort();
+    const c = S.closing[w] || {}, cl = !!c.closed, rows = wkRows(w), tot = wkTotal(w), pt = payTotals(rows), dates = [...new Set(rows.map(e => e.date))].sort();
     const log = (c.log || []).slice().reverse().map(x => `<div class="s">${x.act === "close" ? "마감" : "해제"} · ${fmtAt(x.at)}${x.reason ? ` · 사유: ${esc(x.reason)}` : ""}</div>`).join("");
     const head = `<div class="group"><dl class="kv"><dt>기간</dt><dd>${fmtD(w)} ~ ${fmtD(addDays(w, 6))}</dd><dt>기록된 헌금</dt><dd><b>${wonU(tot)}</b> <span class="hint">(${dates.map(fmtMD).join(", ") || "없음"})</span></dd></dl></div>`;
-    const f = (n, l, h) => `<div class="field"><label>${l}</label><input class="inp money" name="${n}" inputmode="numeric" value="${!cl && c[n] ? won(c[n]) : ""}" placeholder="0">${h ? `<div class="hint">${h}</div>` : ""}</div>`;
-    const body = cl ? head + `<div class="group"><dl class="kv"><dt>현금</dt><dd>${wonU(c.cash)}</dd><dt>직접 입금</dt><dd>${wonU(c.direct)}</dd><dt>은행 입금</dt><dd>${wonU(c.deposit)}</dd><dt>보관 현금</dt><dd>${wonU(c.held)}</dd>${c.memo ? `<dt>메모</dt><dd>${esc(c.memo)}</dd>` : ""}</dl></div>
-        <div class="hint">🔒 마감됨 — 이 주의 헌금·지출은 고칠 수 없습니다.</div>${log ? `<div class="group mt"><div class="group-t">이력</div>${log}</div>` : ""}`
-      : head + `<form id="cl-f" onsubmit="return false"><div class="group">
-        ${f("cash", "현금 (헌금봉투 계수 합계)", "")}${f("direct", "직접 입금 (통장으로 바로 들어온 헌금)", "")}${f("deposit", "은행 입금 (현금을 은행에 넣은 금액)", "")}${f("held", "보관 현금 (교회가 아직 갖고 있는 현금)", "")}
-        <div class="field"><label>메모 (선택)</label><input class="inp" name="memo" value="${esc(c.memo || "")}"></div></div>
-        <div id="cl-chk" class="group"></div></form>${log ? `<div class="group mt"><div class="group-t">이력</div>${log}</div>` : ""}`;
+    const money = (cash, tr) => `<dt>현장 헌금 (현금)</dt><dd>${wonU(cash)}</dd><dt>계좌이체 헌금</dt><dd>${wonU(tr)}</dd>`;
+    let body;
+    if (cl && c.bulk) body = head + `<div class="group"><dl class="kv"><dt>마감 방식</dt><dd>일괄 마감 (계수 검산 생략)</dd>${c.memo ? `<dt>메모</dt><dd>${esc(c.memo)}</dd>` : ""}</dl></div><div class="hint">🔒 마감됨 — 이 주의 헌금·지출은 고칠 수 없습니다.</div>${log ? `<div class="group mt"><div class="group-t">이력</div>${log}</div>` : ""}`;
+    else if (cl) body = head + `<div class="group"><dl class="kv">${money(c.cash, c.direct)}${(c.deposit || c.held) ? `<dt>은행 입금</dt><dd>${wonU(c.deposit)}</dd><dt>보관 현금</dt><dd>${wonU(c.held)}</dd>` : ""}${c.memo ? `<dt>메모</dt><dd>${esc(c.memo)}</dd>` : ""}</dl></div><div class="hint">🔒 마감됨 — 이 주의 헌금·지출은 고칠 수 없습니다.</div>${log ? `<div class="group mt"><div class="group-t">이력</div>${log}</div>` : ""}`;
+    else {
+      const chk = (id, label, amt) => amt ? `<label style="display:flex;gap:10px;align-items:flex-start;padding:10px 4px;cursor:pointer"><input type="checkbox" id="${id}" style="margin-top:3px;width:20px;height:20px"><span>${label} <b>${wonU(amt)}</b> 와(과) 같습니다</span></label>` : `<div class="hint" style="padding:6px 4px">${label.replace(/와.*$/, "")} 없음</div>`;
+      body = head + `<div class="group"><dl class="kv">${money(pt.cash, pt.tr)}</dl></div>
+        <div class="hint" style="padding:4px 2px">헌금 입력의 ‘입금 형태’대로 자동으로 합산했습니다. 실제와 맞는지 대조한 뒤 체크하세요.</div>
+        <form id="cl-f" onsubmit="return false"><div class="group">${chk("cl-c1", "헌금봉투를 센 현금 합계가", pt.cash)}${chk("cl-c2", "통장에서 확인한 이체 입금 합계가", pt.tr)}
+        <div class="field"><label>메모 (선택)</label><input class="inp" name="memo" value="${esc(c.memo || "")}"></div></div></form>${log ? `<div class="group mt"><div class="group-t">이력</div>${log}</div>` : ""}`;
+    }
     const foot = cl ? `<button class="btn" data-x>닫기</button><button class="btn danger" id="cl-re">마감 해제</button>` : `<button class="btn" data-x>닫기</button><button class="btn pri" id="cl-go" disabled>마감하기</button>`;
     const ov = Sheet.open({ title: `${fmtMD(w)} 주 마감`, body, foot });
     if (cl) { $("#cl-re", ov).onclick = () => this.reopen(w); return; }
-    const num = n => parseAmt($(`[name=${n}]`, ov).value) || 0;
-    const calc = () => {
-      const cash = num("cash"), direct = num("direct"), dep = num("deposit"), held = num("held"), d1 = tot - (cash + direct), d2 = cash - (dep + held);
-      const line = (ok, t) => `<div style="padding:3px 0;color:${ok ? "var(--green)" : "var(--red)"}">${ok ? "✓" : "✗"} ${t}</div>`;
-      $("#cl-chk", ov).innerHTML = line(d1 === 0, `기록된 헌금 ${wonU(tot)} = 현금 + 직접 입금 ${wonU(cash + direct)}${d1 ? ` (차액 ${won(d1)}원)` : ""}`) + line(d2 === 0, `현금 ${wonU(cash)} = 은행 입금 + 보관 ${wonU(dep + held)}${d2 ? ` (차액 ${won(d2)}원)` : ""}`) + (tot > 0 ? "" : line(false, "기록된 헌금이 없어 마감할 수 없습니다"));
-      $("#cl-go", ov).disabled = !(tot > 0 && d1 === 0 && d2 === 0);
-    };
-    $$("input.money", ov).forEach(i => { i.oninput = calc; i.onblur = () => { const v = parseAmt(i.value); i.value = v ? won(v) : ""; calc(); }; });
-    calc();
+    const calc = () => { const ok = tot > 0 && (!pt.cash || $("#cl-c1", ov).checked) && (!pt.tr || $("#cl-c2", ov).checked); $("#cl-go", ov).disabled = !ok; };
+    $$("input[type=checkbox]", ov).forEach(i => i.onchange = calc); calc();
     $("#cl-go", ov).onclick = async e => {
-      const now = wkTotal(w); if (now !== tot) { toast("그 사이 헌금 기록이 바뀌었습니다. 다시 열어 확인해 주세요."); Sheet.close(); return; }
+      const now = wkTotal(w), np = payTotals(wkRows(w)); if (now !== tot || np.cash !== pt.cash || np.tr !== pt.tr) { toast("그 사이 헌금 기록이 바뀌었습니다. 다시 열어 확인해 주세요."); Sheet.close(); return; }
       e.target.disabled = true;
-      const doc = { date: w, closed: true, total: tot, cash: num("cash"), direct: num("direct"), deposit: num("deposit"), held: num("held"), memo: $("[name=memo]", ov).value.trim(), at: new Date().toISOString(), log: [...(c.log || []), { at: new Date().toISOString(), act: "close" }].slice(-30) };
+      const doc = { date: w, closed: true, total: tot, cash: pt.cash, direct: pt.tr, memo: $("[name=memo]", ov).value.trim(), at: new Date().toISOString(), log: [...(c.log || []), { at: new Date().toISOString(), act: "close" }].slice(-30) };
       const ok = await Store.set("closing/" + w, doc);
       if (ok === false) { e.target.disabled = false; return; }
       Sheet.close(); toast(`${fmtMD(w)} 주를 마감했습니다`); App.render();
@@ -1300,7 +1299,7 @@ Object.assign(MemberUI, {
 });
 
 /* ========== 헌금 입력 ========== */
-const OF = { date: null, type: null, draft: null, draftDate: null, dirty: false, saveT: null, failed: false, retries: 0, retryT: null, baseU: "", baseMap: {} };
+const OF = { date: null, type: null, pay: "c", draft: null, draftDate: null, dirty: false, saveT: null, failed: false, retries: 0, retryT: null, baseU: "", baseMap: {} };
 /* 편집을 시작한 시점의 문서(updated 시각과 항목별 내용)를 기억해 두었다가, 저장할 때 다른 기기에서 먼저 바뀐 부분과 합친다 */
 function ofBase(doc) { OF.baseU = (doc && doc.updated) || ""; OF.baseMap = {}; for (const e of (doc && doc.entries) || []) if (e.id) OF.baseMap[e.id] = JSON.stringify(e); }
 function ofDoc() {
@@ -1361,7 +1360,7 @@ Views.offer = () => {
   for (const e of doc.entries) for (const t of types) { totals[t] += +(e.a || {})[t] || 0; grand += +(e.a || {})[t] || 0; }
   const recent = Object.keys(S.offerings).sort().reverse().slice(0, 10);
   const usedTypes = types.filter(t => totals[t] || ["십일조", "감사헌금", "주일헌금"].includes(t));
-  const showAll = OF.allCols;
+  const showAll = OF.allCols, pt = payTotals(doc.entries);
   const cols = showAll ? types : usedTypes;
   return topBar("헌금 입력", `${fmtD(d)} (${dow(d)}) · ${doc.entries.length}건 · 합계 ${wonU(grand)}`,
     `<span class="hint" id="of-state"${OF.failed ? ` style="color:var(--red);cursor:pointer;font-weight:700" onclick="OF.retries=0;ofSave(true)"` : ""}>${OF.failed ? "⚠ 저장 실패 — 눌러서 다시 시도" : OF.dirty ? "저장 중…" : "자동 저장"}</span><button class="btn" onclick="OfferUI.importDlg()">엑셀 가져오기</button><button class="btn" onclick="OfferUI.countSheet()">계수 보고서</button>`) + banner() + Lock.note(d) +
@@ -1373,6 +1372,7 @@ Views.offer = () => {
         <div style="flex:2;min-width:160px;position:relative"><input class="inp" id="qa-name" placeholder="헌금자 이름" autocomplete="off"></div>
         <select class="inp" id="qa-type" style="flex:1;min-width:120px">${opt(types, OF.type)}</select>
         <input class="inp money" id="qa-amt" placeholder="금액" inputmode="numeric" style="flex:1;min-width:120px">
+        <div class="chips" id="qa-pay" style="flex:none;flex-wrap:nowrap;margin:0"><span class="chip ${OF.pay !== "t" ? "on" : ""}" data-p="c">현장</span><span class="chip ${OF.pay === "t" ? "on" : ""}" data-p="t">계좌이체</span></div>
         <input class="inp" id="qa-memo" placeholder="메모 (선택)" style="flex:1.2;min-width:120px">
         <button class="btn pri" id="qa-add">추가 ↵</button>
       </div>
@@ -1380,26 +1380,28 @@ Views.offer = () => {
     </div>
     <div class="grid" style="grid-template-columns:minmax(0,1fr) 280px" id="of-grid">
     <div class="card" style="padding:12px"><h3 style="padding:4px 6px">이번 주 헌금 내역 <span><label class="hint" style="display:inline-flex;gap:6px;align-items:center;cursor:pointer"><input type="checkbox" ${showAll ? "checked" : ""} onchange="OF.allCols=this.checked;App.render()">모든 헌금 종류 열 보기</label></span></h3>
-      ${doc.entries.length ? `<div class="tbl-wrap"><table class="tbl oe"><thead><tr><th>헌금자</th>${cols.map(t => `<th class="n">${esc(t)}</th>`).join("")}<th class="n">합계</th><th>메모</th><th></th></tr></thead><tbody>
-      ${doc.entries.map((e, i) => `<tr data-i="${i}"><td><input class="nm" data-f="name" value="${esc(e.mid ? mName(e.mid) || e.name : e.name)}" ${e.mid ? "" : `style="color:var(--orange)"`} title="${e.mid ? "" : "명단에 없는 이름"}"></td>${cols.map(t => `<td><input data-t="${esc(t)}" inputmode="numeric" value="${(e.a || {})[t] ? won(e.a[t]) : ""}"></td>`).join("")}<td class="n" style="font-weight:600">${won(rowTotal(e))}</td><td><input class="nm" data-f="memo" value="${esc(e.memo || "")}" style="min-width:90px"></td><td><button class="icon-btn" data-del="${i}" title="삭제">✕</button></td></tr>`).join("")}
-      <tr class="sum"><td>합계</td>${cols.map(t => `<td class="n">${won(totals[t])}</td>`).join("")}<td class="n">${won(grand)}</td><td colspan="2"></td></tr></tbody></table></div>` :
+      ${doc.entries.length ? `<div class="tbl-wrap"><table class="tbl oe"><thead><tr><th>헌금자</th><th style="white-space:nowrap">입금</th>${cols.map(t => `<th class="n">${esc(t)}</th>`).join("")}<th class="n">합계</th><th>메모</th><th></th></tr></thead><tbody>
+      ${doc.entries.map((e, i) => `<tr data-i="${i}"><td><input class="nm" data-f="name" value="${esc(e.mid ? mName(e.mid) || e.name : e.name)}" ${e.mid ? "" : `style="color:var(--orange)"`} title="${e.mid ? "" : "명단에 없는 이름"}"></td><td><button class="btn sm" data-pay="${i}" style="padding:4px 9px;min-width:0;white-space:nowrap;${e.pay === "t" ? "background:#e8f1ff;color:#0a4a8a" : ""}">${e.pay === "t" ? "이체" : "현장"}</button></td>${cols.map(t => `<td><input data-t="${esc(t)}" inputmode="numeric" value="${(e.a || {})[t] ? won(e.a[t]) : ""}"></td>`).join("")}<td class="n" style="font-weight:600">${won(rowTotal(e))}</td><td><input class="nm" data-f="memo" value="${esc(e.memo || "")}" style="min-width:90px"></td><td><button class="icon-btn" data-del="${i}" title="삭제">✕</button></td></tr>`).join("")}
+      <tr class="sum"><td>합계</td><td></td>${cols.map(t => `<td class="n">${won(totals[t])}</td>`).join("")}<td class="n">${won(grand)}</td><td colspan="2"></td></tr></tbody></table></div>` :
       `<div class="empty"><div class="e">₩</div>위의 빠른 입력 칸에서 헌금자와 금액을 입력하세요.</div>`}
       <div style="padding:8px 6px"><button class="btn sm" onclick="OfferUI.addBlank()">＋ 빈 줄 추가</button></div>
     </div>
     <div>
       <div class="card"><h3>종류별 합계</h3>${types.filter(t => totals[t]).map(t => `<div style="display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid var(--line2)"><span>${esc(t)}</span><b class="money">${won(totals[t])}</b></div>`).join("") || `<div class="hint">아직 입력이 없습니다.</div>`}
       <div style="display:flex;justify-content:space-between;padding:10px 0 0;font-size:17px"><b>합계</b><b>${wonU(grand)}</b></div></div>
+      <div class="card"><h3>입금 형태별</h3><div style="display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid var(--line2)"><span>현장 헌금</span><b class="money">${won(pt.cash)}</b></div><div style="display:flex;justify-content:space-between;padding:5px 0"><span>계좌이체 헌금</span><b class="money">${won(pt.tr)}</b></div></div>
       <div class="card"><h3>최근 입력한 주</h3>${recent.length ? recent.map(r => { const t = (S.offerings[r].entries || []).reduce((s, e) => s + rowTotal(e), 0); return `<div class="row" style="padding:8px 4px" onclick="OfferUI.setDate('${r}')"><div class="main"><div class="t">${fmtD(r)}</div><div class="s">${(S.offerings[r].entries || []).length}건</div></div><div class="r">${won(t)}</div></div>`; }).join("") : `<div class="hint">기록이 없습니다.</div>`}</div>
     </div></div>`;
 };
 Views._after_offer = () => {
   const g = $("#of-grid"); if (g && innerWidth < 1000) g.style.gridTemplateColumns = "1fr";
-  if (Lock.closed(OF.date)) { $$("#qa-name,#qa-type,#qa-amt,#qa-memo,#qa-add,.oe input,[data-del]").forEach(e => { e.disabled = true; }); $$("button").forEach(b => { if (/빈 줄 추가/.test(b.textContent)) b.disabled = true; }); }
+  if (Lock.closed(OF.date)) { $$("#qa-name,#qa-type,#qa-amt,#qa-memo,#qa-add,.oe input,[data-del],[data-pay]").forEach(e => { e.disabled = true; }); $$("button").forEach(b => { if (/빈 줄 추가/.test(b.textContent)) b.disabled = true; }); }
   const nm = $("#qa-name"), ty = $("#qa-type"), am = $("#qa-amt"), mo = $("#qa-memo");
   Autocomplete(nm, q => members().filter(m => m.name.includes(q)).sort((a, b) => a.name.localeCompare(b.name, "ko")).slice(0, 8).map(m => ({ v: m.name, id: m.id, s: [m.pos, m.kind === "외부" ? "외부" : m.group, m.archived ? "보관" : ""].filter(Boolean).join(" · ") })), it => { nm.dataset.mid = it.id; am.focus(); });
   nm.oninput = () => { delete nm.dataset.mid; };
   $$("#qa-types .chip").forEach(c => c.onclick = () => { OF.type = c.dataset.t; ty.value = OF.type; $$("#qa-types .chip").forEach(x => x.classList.toggle("on", x === c)); am.focus(); });
   ty.onchange = () => { OF.type = ty.value; $$("#qa-types .chip").forEach(x => x.classList.toggle("on", x.dataset.t === OF.type)); };
+  $$("#qa-pay .chip").forEach(c => c.onclick = () => { OF.pay = c.dataset.p; $$("#qa-pay .chip").forEach(x => x.classList.toggle("on", x === c)); });
   const add = () => OfferUI.quickAdd(nm.value.trim(), nm.dataset.mid, ty.value, parseAmt(am.value), mo.value.trim());
   $("#qa-add").onclick = add;
   [nm, am, mo].forEach(el => el.addEventListener("keydown", e => { if (e.key === "Enter" && !e.isComposing && !$(".ac-list div.on")) { e.preventDefault(); if (el === nm) { am.focus(); return; } add(); } }));
@@ -1416,6 +1418,7 @@ Views._after_offer = () => {
     });
   });
   $$("[data-del]").forEach(b => b.onclick = () => { ofDoc().entries.splice(+b.dataset.del, 1); ofSave(); App.render(); });
+  $$("[data-pay]").forEach(b => b.onclick = () => { const e = ofDoc().entries[+b.dataset.pay]; if (e.pay === "t") delete e.pay; else e.pay = "t"; ofSave(); App.render(); });
   if (!App._focusQA) { nm.focus(); App._focusQA = true; }
 };
 const OfferUI = {
@@ -1429,12 +1432,13 @@ const OfferUI = {
     if (!amt) { toast("금액을 입력하세요"); $("#qa-amt").focus(); return; }
     if (!mid) { const m = members().find(x => x.name === name); if (m) mid = m.id; }
     const go = mid => {
-      const doc = ofDoc(); let e = doc.entries.find(x => x.mid && x.mid === mid) || (!mid && doc.entries.find(x => !x.mid && x.name === name));
-      if (!e) { e = { id: uid(), mid: mid || "", name, a: {} }; doc.entries.push(e); }
+      const doc = ofDoc(), pay = OF.pay === "t" ? "t" : "", same = x => (x.pay === "t" ? "t" : "") === pay;
+      let e = doc.entries.find(x => x.mid && x.mid === mid && same(x)) || (!mid && doc.entries.find(x => !x.mid && x.name === name && same(x)));
+      if (!e) { e = { id: uid(), mid: mid || "", name, a: {} }; if (pay) e.pay = "t"; doc.entries.push(e); }
       e.a = e.a || {}; e.a[type] = (+e.a[type] || 0) + amt; if (memo) e.memo = [e.memo, memo].filter(Boolean).join(", ");
       OF.type = type; ofSave(); App.render();
       setTimeout(() => { const n = $("#qa-name"); n && n.focus(); }, 30);
-      toast(`${name} · ${type} ${wonU(amt)} 추가`);
+      toast(`${name} · ${type} ${wonU(amt)} 추가${OF.pay === "t" ? " (계좌이체)" : ""}`);
     };
     if (mid) return go(mid);
     const ov = Sheet.open({
@@ -1450,8 +1454,9 @@ const OfferUI = {
     const used = types.filter(t => tot[t]);
     const html = printDoc(`헌금 계수 보고서 ${OF.date}`, `<div class="page"><h1>헌금 계수 보고서</h1><div class="meta">${esc(c.name)} · ${fmtD(OF.date)} (${dow(OF.date)})</div>
       <h2>종류별 합계</h2><table><tr>${used.map(t => `<th>${esc(t)}</th>`).join("")}<th>합계</th></tr><tr>${used.map(t => `<td class="n">${won(tot[t])}</td>`).join("")}<td class="n"><b>${won(g)}</b></td></tr></table>
+      <div style="margin:8px 0;font-size:10pt">입금 형태별 : 현장 헌금 ${won(payTotals(doc.entries).cash)}원 · 계좌이체 헌금 ${won(payTotals(doc.entries).tr)}원</div>
       <h2>헌금자별 내역 (${doc.entries.length}건)</h2><table><tr><th>번호</th><th>헌금자</th>${used.map(t => `<th>${esc(t)}</th>`).join("")}<th>합계</th><th>메모</th></tr>
-      ${doc.entries.map((e, i) => `<tr><td style="text-align:center">${i + 1}</td><td>${esc(e.mid ? mName(e.mid) : e.name)}</td>${used.map(t => `<td class="n">${(e.a || {})[t] ? won(e.a[t]) : ""}</td>`).join("")}<td class="n">${won(rowTotal(e))}</td><td>${esc(e.memo || "")}</td></tr>`).join("")}
+      ${doc.entries.map((e, i) => `<tr><td style="text-align:center">${i + 1}</td><td>${esc(e.mid ? mName(e.mid) : e.name)}${e.pay === "t" ? " (이체)" : ""}</td>${used.map(t => `<td class="n">${(e.a || {})[t] ? won(e.a[t]) : ""}</td>`).join("")}<td class="n">${won(rowTotal(e))}</td><td>${esc(e.memo || "")}</td></tr>`).join("")}
       <tr class="sum"><td colspan="2">합계</td>${used.map(t => `<td class="n">${won(tot[t])}</td>`).join("")}<td class="n">${won(g)}</td><td></td></tr></table>
       <table style="margin-top:24px"><tr><th style="width:33%">계수자 1</th><th style="width:33%">계수자 2</th><th>재정 담당 확인</th></tr><tr style="height:60px"><td></td><td></td><td></td></tr></table></div>`);
     previewDoc("헌금 계수 보고서", html, `헌금 계수 보고서 ${OF.date}.html`);
