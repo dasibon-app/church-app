@@ -283,7 +283,7 @@ const FY = {
 const ymKey = (y, m) => `${y}-${pad(m)}`;
 
 /* ========== 기본 설정 ========== */
-const APP_VERSION = "1.0.4", APP_DATE = "2026-11-06", APP_EDITION = "구독자 배포판";
+const APP_VERSION = "1.1.0", APP_DATE = "2026-11-07", APP_EDITION = "구독자 배포판";
 const MAKER = { church: "다시본교회", pastor: "주진규 목사", home: "https://dasibon.icg21.com/", bulletin: "https://dasibon-church.jinkyuju.workers.dev/", youtube: "https://www.youtube.com/@dasibon", releases: "https://github.com/dasibon-app/church-app/releases/latest" };
 const makerHtml = () => `<b>${MAKER.church}</b> ${MAKER.pastor}가 작은 교회를 위해 만들어 무료로 나눕니다.<br>
   <a href="${MAKER.home}" target="_blank" rel="noopener noreferrer">교회 홈페이지</a> · <a href="${MAKER.bulletin}" target="_blank" rel="noopener noreferrer">웹주보</a> · <a href="${MAKER.youtube}" target="_blank" rel="noopener noreferrer">유튜브</a>`;
@@ -323,8 +323,8 @@ const DEFAULT_SETTINGS = {
 
 /* ========== 저장소 (claude db ↔ 로컬 대체) ========== */
 const CH = () => (typeof ST === "function" && ST() && ST().church && (ST().church.short || ST().church.name)) || "교회";
-const S = { settings: null, members: {}, offerings: {}, attendance: {}, expenses: {}, receipts: {} };
-const COLS = ["members", "offerings", "attendance", "expenses", "receipts"];
+const S = { settings: null, members: {}, offerings: {}, attendance: {}, expenses: {}, receipts: {}, closing: {} };
+const COLS = ["members", "offerings", "attendance", "expenses", "receipts", "closing"];
 const Store = {
   mode: "loading", db: null, chains: {}, err: "", hold: {},
   /* 방금 바꾼 문서는 서버에서 늦게 도착한 옛 스냅샷이 덮어쓰지 못하게 잠시 보호 (모바일 출석 체크 풀림 방지) */
@@ -349,7 +349,7 @@ const Store = {
         try { db = await Promise.race([window.claude.use("db"), new Promise(r => setTimeout(() => r(null), 10000))]); } catch (e) { db = null; }
       }
     }
-    if (db) { this.db = db; this.mode = "cloud"; this.subscribe(); if (typeof AutoBackup !== "undefined") AutoBackup.attach(); }
+    if (db) { this.db = db; this.mode = "cloud"; this.subscribe(); if (typeof AutoBackup !== "undefined") AutoBackup.attach(); if (typeof Restore !== "undefined") Restore.attach(); }
     else if (inClaude) { this.mode = "offline"; this.offlineScreen(); }
     else { this.mode = "local"; this.loadLocal(); App.ready(); }
   },
@@ -422,6 +422,7 @@ const Store = {
       const nx = build(structuredClone(latest));
       if (!nx) return null;
       delete nx._mig;
+      Restore.beforeWrite();
       this.hist(latest);
       S.settings = migrateSettings(structuredClone(nx)); delete S.settings._mig;
       await this.db.doc("settings/main").set(JSON.parse(JSON.stringify(nx)));
@@ -439,10 +440,13 @@ const Store = {
     } catch (e) { }
   },
   /* path: "members/abc" */
-  async set(path, data) {
+  async set(path, data, opts) {
     const [c, id] = path.split("/");
     data = JSON.parse(JSON.stringify(data));
     if (c === "settings" && this.mode === "cloud") return this.writeSettings(() => data);
+    /* 마감된 주의 헌금·지출은 금액·날짜를 바꾸는 저장을 막는다 (복원 같은 내부 작업만 force) */
+    if (!(opts && opts.force) && c !== "settings") { const lk = Lock.check(c, id, data); if (lk) { Lock.warn(lk); return false; } }
+    if (this.mode === "cloud" && !(opts && opts.force)) Restore.beforeWrite();
     if (c === "settings") S.settings = data; else S[c][id] = data;
     if (this.mode !== "cloud") { this.saveLocal(); App.changed(); return true; }
     const prev = this.chains[path] || Promise.resolve();
@@ -469,8 +473,11 @@ const Store = {
     });
     return { kept, clash: [...new Set(clash)] };
   },
-  async del(path) {
-    const [c, id] = path.split("/"); delete S[c][id];
+  async del(path, opts) {
+    const [c, id] = path.split("/");
+    if (!(opts && opts.force)) { const lk = Lock.check(c, id, null); if (lk) { Lock.warn(lk); return false; } }
+    if (this.mode === "cloud" && !(opts && opts.force)) Restore.beforeWrite();
+    delete S[c][id];
     if (this.mode !== "cloud") { this.saveLocal(); App.changed(); return true; }
     const prev = this.chains[path] || Promise.resolve();
     this.keep(path); const h = this.hold[path]; h.n++;
@@ -496,6 +503,30 @@ function migrateSettings(s) {
 
 /* ========== 도메인 헬퍼 ========== */
 const ST = () => S.settings;
+
+/* ========== 주간 마감 ========== */
+const fmtAt = iso => { try { return new Date(iso).toLocaleString("ko-KR", { timeZone: "Asia/Seoul", year: "numeric", month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false }); } catch (e) { return ""; } };
+const Lock = {
+  closed(d) { const c = (S.closing || {})[lastSunday(d)]; return !!(c && c.closed); },
+  offFp(doc) { return ((doc && doc.entries) || []).map(e => (e.id || "") + ":" + rowTotal(e)).sort().join(","); },
+  expMap(doc) { const o = {}; for (const e of (doc && doc.items) || []) o[e.id] = [e.date, +e.amount || 0, e.itemId || ""].join("|"); return o; },
+  /* 마감된 주의 기록이 달라지는 저장이면 그 날짜를 돌려준다. 이름·메모만 바뀌는 저장(종류 이름 변경, 성도 합치기 등)은 통과 */
+  check(c, id, next) {
+    if (!Object.values(S.closing || {}).some(x => x && x.closed)) return "";
+    if (c === "offerings") { if (!this.closed(id)) return ""; return this.offFp(S.offerings[id]) === this.offFp(next) ? "" : id; }
+    if (c === "expenses") {
+      const a = this.expMap(S.expenses[id]), b = this.expMap(next);
+      for (const k of new Set([...Object.keys(a), ...Object.keys(b)])) if (a[k] !== b[k]) for (const f of [a[k], b[k]]) if (f && this.closed(f.split("|")[0])) return f.split("|")[0];
+    }
+    return "";
+  },
+  warn(d) { toast(`🔒 ${fmtMD(lastSunday(d))} 주는 마감되어 있어 고칠 수 없습니다. ‘주간 마감’에서 사유를 남기고 해제해 주세요.`); },
+  note(d) {
+    if (!this.closed(d)) return "";
+    const w = lastSunday(d);
+    return `<div class="banner" style="background:#fff4e5;color:#8a4b00;border-color:#ffd9a0">🔒 <b>${fmtMD(w)} 주는 마감되었습니다.</b> 헌금·지출을 고치려면 먼저 마감을 해제해야 합니다. <button class="btn sm" onclick="ClosingUI.open('${w}')">주간 마감 열기</button></div>`;
+  },
+};
 /* 3자 비교 병합: b=편집 시작 값, m=내가 바꾼 값, t=서버 최신값 */
 const J3 = v => v === undefined ? "\u0000u" : JSON.stringify(v);
 const isPlain = v => v && typeof v === "object" && !Array.isArray(v);
@@ -579,6 +610,7 @@ const NAV = [
   { k: "members", t: "성도 교적", ic: "👤", c: "#34c759", sec: "교적" },
   { k: "attend", t: "출석 체크", ic: "✓", c: "#30b0c7" },
   { k: "offer", t: "헌금 입력", ic: "₩", c: "#ff9500", sec: "재정" },
+  { k: "closing", t: "주간 마감", ic: "🔒", c: "#ff9f0a" },
   { k: "expense", t: "지출 관리", ic: "−", c: "#ff3b30" },
   { k: "reports", t: "보고서·통계", ic: "▤", c: "#5856d6" },
   { k: "receipts", t: "기부금 영수증", ic: "✉", c: "#af52de" },
@@ -606,7 +638,7 @@ const App = {
     h += `<div class="side-foot" id="syncbox"></div>`;
     $("#side").innerHTML = h;
     const lab = { home: ["⌂", "홈"], members: ["👤", "성도"], attend: ["✓", "출석"], offer: ["₩", "헌금"], more: ["⋯", "더보기"] };
-    const inMore = ["expense", "reports", "receipts", "settings", "more"].includes(this.view);
+    const inMore = ["expense", "closing", "reports", "receipts", "settings", "more"].includes(this.view);
     $("#tabbar").innerHTML = TABS.map(k => `<button data-go="${k}" class="${(this.view === k || (k === "more" && inMore)) ? "on" : ""}"><span class="ti">${lab[k][0]}</span>${lab[k][1]}</button>`).join("");
     this.sync();
   },
@@ -706,9 +738,9 @@ Views.home = () => {
     <div class="hint mt">버전 ${APP_VERSION} · ${APP_EDITION}</div>
     <div class="hint mt" style="white-space:normal;line-height:1.8">${makerHtml()}</div></div>`;
   const t = today(), fy = FY.cur(), [fa, fb] = FY.range(fy), sun = lastSunday();
-  const ms = members(), active = ms.filter(m => m.status !== "이명" && m.status !== "별세" && m.kind !== "외부");
-  const att = S.attendance[sun], attN = att ? (att.present || []).length + (+att.visitors || 0) : 0;
-  const prevAtt = S.attendance[addDays(sun, -7)], prevN = prevAtt ? (prevAtt.present || []).length + (+prevAtt.visitors || 0) : 0;
+  const ms = members(), active = ms.filter(m => m.status !== "이명" && m.status !== "별세" && m.kind !== "외부" && !m.archived);
+  const att = attDoc(sun), attN = att ? (att.present || []).length + (+att.visitors || 0) : 0;
+  const prevAtt = attDoc(addDays(sun, -7)), prevN = prevAtt ? (prevAtt.present || []).length + (+prevAtt.visitors || 0) : 0;
   const wk = incomeBy(sun, sun), mo = incomeBy(t.slice(0, 7) + "-01", t);
   const inc = incomeBy(fa, fb), ex = expenseBy(fa, fb), bud = budgetOf(fy);
   const budInc = Object.entries(bud.income || {}).filter(([k]) => k !== "__carry").reduce((s, [, v]) => s + (+v || 0), 0);
@@ -718,7 +750,7 @@ Views.home = () => {
   // 최근 8주 차트
   const weeks = Array.from({ length: 8 }, (_, i) => addDays(sun, -7 * (7 - i)));
   const wv = weeks.map(w => incomeBy(w, addDays(w, 6)).total), wmax = Math.max(1, ...wv);
-  const av = weeks.map(w => { const a = S.attendance[w]; return a ? (a.present || []).length + (+a.visitors || 0) : 0; }), amax = Math.max(1, ...av);
+  const av = weeks.map(w => { const a = attDoc(w); return a ? (a.present || []).length + (+a.visitors || 0) : 0; }), amax = Math.max(1, ...av);
   // 생일
   const mm = t.slice(5, 7);
   const bdays = active.filter(m => m.birth && m.birth.slice(5, 7) === mm).sort((a, b) => a.birth.slice(8) < b.birth.slice(8) ? -1 : 1);
@@ -726,7 +758,7 @@ Views.home = () => {
   const absent = absentees(3);
   const monthIdx = FY.months(fy).findIndex(([y, m]) => ymKey(y, m) === t.slice(0, 7)) + 1;
   return topBar("안녕하세요, 목사님", `${fmtD(t)} (${dow(t)}) · ${fy}년 회계연도 ${monthIdx}개월째`,
-    `<button class="btn" data-go="attend">출석 체크</button><button class="btn pri" data-go="offer">이번 주 헌금 입력</button>`) + banner() +
+    `<button class="btn" data-go="attend">출석 체크</button><button class="btn pri" data-go="offer">이번 주 헌금 입력</button>`) + banner() + homeNotes() +
     `<div class="grid g4">
       <div class="stat"><div class="l"><span class="dot" style="background:var(--teal)"></span>지난 주일 출석</div><div class="v">${attN}명</div><div class="d">${fmtMD(sun)} · 전주 대비 ${attN - prevN >= 0 ? "+" : ""}${attN - prevN}명</div></div>
       <div class="stat"><div class="l"><span class="dot" style="background:var(--orange)"></span>지난 주일 헌금</div><div class="v">${man(wk.total)}</div><div class="d">이번 달 누계 ${wonU(mo.total)}</div></div>
@@ -751,15 +783,85 @@ Views.home = () => {
 };
 function absentees(n) {
   /* 주일 예배 기록만 센다: 일요일이 아닌 날짜(주중 예배)나 아무도 체크하지 않은 날(미입력)은 제외 */
-  const dates = Object.keys(S.attendance).filter(d => parseD(d).getDay() === 0 && (S.attendance[d].present || []).length > 0).sort().reverse().slice(0, 12);
+  const dates = Object.keys(S.attendance).filter(d => attDone(d) && parseD(d).getDay() === 0 && (S.attendance[d].present || []).length > 0).sort().reverse().slice(0, 12);
   if (dates.length < n) return [];
   const out = [];
   for (const m of members()) {
-    if (m.kind === "외부" || ["이명", "별세"].includes(m.status)) continue;
+    if (m.kind === "외부" || m.archived || ["이명", "별세"].includes(m.status)) continue;
     let k = 0; for (const d of dates) { if ((S.attendance[d].present || []).includes(m.id)) break; if (m.reg && m.reg > d) break; k++; }
     if (k >= n) out.push({ ...m, n: k });
   }
   return out.sort((a, b) => b.n - a.n);
+}
+
+/* ========== 주간 마감 화면 ========== */
+const wkRows = w => offeringRows(w, addDays(w, 6));
+const wkTotal = w => wkRows(w).reduce((s, e) => s + rowTotal(e), 0);
+const CL = { all: false };
+Views.closing = () => {
+  const ws = new Set(Object.keys(S.closing || {})); for (const d of Object.keys(S.offerings)) ws.add(lastSunday(d));
+  const list = [...ws].sort().reverse(), shown = CL.all ? list : list.slice(0, 16);
+  const rows = shown.map(w => {
+    const c = S.closing[w], cl = !!(c && c.closed), tot = wkTotal(w), exN = expenseRows(w, addDays(w, 6)).length;
+    return `<div class="row" onclick="ClosingUI.open('${w}')"><div class="main"><div class="t">${fmtD(w)} 주일 주간 <span class="tag ${cl ? "green" : "orange"}">${cl ? "🔒 마감" : "미마감"}</span></div>
+      <div class="s">${fmtMD(w)} ~ ${fmtMD(addDays(w, 6))} · 헌금 ${wonU(tot)} · 지출 ${exN}건${c && (c.log || []).some(x => x.act === "reopen") ? " · 해제 이력 있음" : ""}</div></div><span class="chev">›</span></div>`;
+  }).join("");
+  return topBar("주간 마감", "헌금 계수를 맞춰 본 뒤, 그 주의 헌금·지출을 잠급니다") + banner() +
+    `<div class="card" style="margin-bottom:14px"><div class="hint">주일부터 토요일까지 한 주를 기준으로 합니다. ① 기록된 헌금 합계 = 현금 + 직접 입금(계좌이체), ② 현금 = 은행 입금 + 교회 보관 현금 이 모두 맞아야 마감됩니다. <b>마감하면 그 주의 헌금·지출은 고칠 수 없고</b>, 고쳐야 할 때는 사유를 남기고 해제합니다. 해제·재마감 이력은 남습니다.</div></div>` +
+    (rows ? `<div class="list">${rows}</div>${list.length > shown.length ? `<div class="mt"><button class="btn" onclick="CL.all=true;App.render()">이전 주 모두 보기 (${list.length}주)</button></div>` : ""}` : `<div class="card empty"><div class="e">🔒</div>아직 입력된 헌금이 없습니다.</div>`);
+};
+const ClosingUI = {
+  open(w) {
+    const c = S.closing[w] || {}, cl = !!c.closed, tot = wkTotal(w), dates = [...new Set(wkRows(w).map(e => e.date))].sort();
+    const log = (c.log || []).slice().reverse().map(x => `<div class="s">${x.act === "close" ? "마감" : "해제"} · ${fmtAt(x.at)}${x.reason ? ` · 사유: ${esc(x.reason)}` : ""}</div>`).join("");
+    const head = `<div class="group"><dl class="kv"><dt>기간</dt><dd>${fmtD(w)} ~ ${fmtD(addDays(w, 6))}</dd><dt>기록된 헌금</dt><dd><b>${wonU(tot)}</b> <span class="hint">(${dates.map(fmtMD).join(", ") || "없음"})</span></dd></dl></div>`;
+    const f = (n, l, h) => `<div class="field"><label>${l}</label><input class="inp money" name="${n}" inputmode="numeric" value="${!cl && c[n] ? won(c[n]) : ""}" placeholder="0">${h ? `<div class="hint">${h}</div>` : ""}</div>`;
+    const body = cl ? head + `<div class="group"><dl class="kv"><dt>현금</dt><dd>${wonU(c.cash)}</dd><dt>직접 입금</dt><dd>${wonU(c.direct)}</dd><dt>은행 입금</dt><dd>${wonU(c.deposit)}</dd><dt>보관 현금</dt><dd>${wonU(c.held)}</dd>${c.memo ? `<dt>메모</dt><dd>${esc(c.memo)}</dd>` : ""}</dl></div>
+        <div class="hint">🔒 마감됨 — 이 주의 헌금·지출은 고칠 수 없습니다.</div>${log ? `<div class="group mt"><div class="group-t">이력</div>${log}</div>` : ""}`
+      : head + `<form id="cl-f" onsubmit="return false"><div class="group">
+        ${f("cash", "현금 (헌금봉투 계수 합계)", "")}${f("direct", "직접 입금 (통장으로 바로 들어온 헌금)", "")}${f("deposit", "은행 입금 (현금을 은행에 넣은 금액)", "")}${f("held", "보관 현금 (교회가 아직 갖고 있는 현금)", "")}
+        <div class="field"><label>메모 (선택)</label><input class="inp" name="memo" value="${esc(c.memo || "")}"></div></div>
+        <div id="cl-chk" class="group"></div></form>${log ? `<div class="group mt"><div class="group-t">이력</div>${log}</div>` : ""}`;
+    const foot = cl ? `<button class="btn" data-x>닫기</button><button class="btn danger" id="cl-re">마감 해제</button>` : `<button class="btn" data-x>닫기</button><button class="btn pri" id="cl-go" disabled>마감하기</button>`;
+    const ov = Sheet.open({ title: `${fmtMD(w)} 주 마감`, body, foot });
+    if (cl) { $("#cl-re", ov).onclick = () => this.reopen(w); return; }
+    const num = n => parseAmt($(`[name=${n}]`, ov).value) || 0;
+    const calc = () => {
+      const cash = num("cash"), direct = num("direct"), dep = num("deposit"), held = num("held"), d1 = tot - (cash + direct), d2 = cash - (dep + held);
+      const line = (ok, t) => `<div style="padding:3px 0;color:${ok ? "var(--green)" : "var(--red)"}">${ok ? "✓" : "✗"} ${t}</div>`;
+      $("#cl-chk", ov).innerHTML = line(d1 === 0, `기록된 헌금 ${wonU(tot)} = 현금 + 직접 입금 ${wonU(cash + direct)}${d1 ? ` (차액 ${won(d1)}원)` : ""}`) + line(d2 === 0, `현금 ${wonU(cash)} = 은행 입금 + 보관 ${wonU(dep + held)}${d2 ? ` (차액 ${won(d2)}원)` : ""}`) + (tot > 0 ? "" : line(false, "기록된 헌금이 없어 마감할 수 없습니다"));
+      $("#cl-go", ov).disabled = !(tot > 0 && d1 === 0 && d2 === 0);
+    };
+    $$("input.money", ov).forEach(i => { i.oninput = calc; i.onblur = () => { const v = parseAmt(i.value); i.value = v ? won(v) : ""; calc(); }; });
+    calc();
+    $("#cl-go", ov).onclick = async e => {
+      const now = wkTotal(w); if (now !== tot) { toast("그 사이 헌금 기록이 바뀌었습니다. 다시 열어 확인해 주세요."); Sheet.close(); return; }
+      e.target.disabled = true;
+      const doc = { date: w, closed: true, total: tot, cash: num("cash"), direct: num("direct"), deposit: num("deposit"), held: num("held"), memo: $("[name=memo]", ov).value.trim(), at: new Date().toISOString(), log: [...(c.log || []), { at: new Date().toISOString(), act: "close" }].slice(-30) };
+      const ok = await Store.set("closing/" + w, doc);
+      if (ok === false) { e.target.disabled = false; return; }
+      Sheet.close(); toast(`${fmtMD(w)} 주를 마감했습니다`); App.render();
+    };
+  },
+  reopen(w) {
+    const c = S.closing[w] || {};
+    const ov = Sheet.open({ title: "마감 해제", body: `<p class="hint">${fmtMD(w)} 주의 마감을 풀면 헌금·지출을 고칠 수 있습니다. <b>해제 사유가 이력으로 남습니다.</b> 고친 뒤에는 다시 마감해 주세요.</p><div class="field"><label>해제 사유 *</label><textarea class="inp" id="cl-reason" rows="3" placeholder="예: 11/2 감사헌금 이름 오기 수정"></textarea></div>`, foot: `<button class="btn" data-x>취소</button><button class="btn danger" id="cl-re2">마감 해제</button>` });
+    $("#cl-re2", ov).onclick = async () => {
+      const reason = $("#cl-reason", ov).value.trim(); if (!reason) { toast("해제 사유를 적어 주세요"); return; }
+      const doc = { ...c, closed: false, log: [...(c.log || []), { at: new Date().toISOString(), act: "reopen", reason }].slice(-30) };
+      const ok = await Store.set("closing/" + w, doc); if (ok === false) return;
+      Sheet.close(); toast("마감을 해제했습니다. 고친 뒤 다시 마감해 주세요."); App.render();
+    };
+  },
+};
+
+/* 홈 알림: 아직 마감하지 않은 지난 주, 입력 중인 주일 출석 */
+function homeNotes() {
+  const t = today(), sun = lastSunday(t), out = [];
+  const cand = parseD(t).getDay() === 0 ? [addDays(sun, -7), addDays(sun, -14)] : [sun, addDays(sun, -7)];
+  for (const w of cand) if (wkTotal(w) > 0 && !Lock.closed(w)) out.push(`<div class="banner" style="background:#fff4e5;color:#8a4b00;border-color:#ffd9a0">🔒 <b>${fmtMD(w)} 주 헌금이 아직 마감되지 않았습니다.</b> <button class="btn sm" onclick="ClosingUI.open('${w}')">마감하기</button></div>`);
+  for (const d of Object.keys(S.attendance).sort().reverse().slice(0, 6)) if (S.attendance[d].done === false && d < t) out.push(`<div class="banner" style="background:#eaf3ff;color:#0a4a8a;border-color:#b9d6f5">✓ <b>${fmtMD(d)} 출석이 ‘입력 중’입니다.</b> 모두 체크했으면 ‘입력 완료’를 눌러야 통계에 반영됩니다. <button class="btn sm" onclick="AT.date='${d}';AT.mode='check';App.go('attend')">출석 체크 열기</button></div>`);
+  return out.join("");
 }
 
 /* ========== 더보기 (모바일) ========== */
@@ -769,7 +871,8 @@ Views.more = () => topBar("더보기", "") + `<div class="more-grid">${NAV.filte
 const MF = { q: "", pos: "", group: "", status: "활동", course: "", sort: "name" };
 Views.members = () => {
   const ms = filteredMembers();
-  const all = members().filter(m => m.kind !== "외부");
+  const all = members().filter(m => m.kind !== "외부" && !m.archived);
+  const arcN = members().filter(m => m.archived).length;
   const cnt = s => all.filter(m => m.status === s).length;
   const isAtt = m => /출석중/.test(m.status || ""), isOnl = m => isAtt(m) && /온라인/.test(m.status || "");
   const attN = all.filter(isAtt).length, onlineN = all.filter(isOnl).length;
@@ -778,7 +881,7 @@ Views.members = () => {
     `<button class="btn" onclick="MemberUI.toggleMode()">${MSEL.on ? "선택 완료" : "선택"}</button><button class="btn" onclick="MemberUI.dupDlg()">중복 정리${dups ? ` <span class="tag orange" style="margin:0">${dups}</span>` : ""}</button><button class="btn" onclick="MemberUI.importDlg()">엑셀 가져오기</button><button class="btn" onclick="MemberUI.exportX()">엑셀 내보내기</button><button class="btn pri" onclick="MemberUI.open()">＋ 성도 등록</button>`) + banner() + selBar() +
     `<div class="toolbar">
       <div class="search"><input class="inp" id="mq" placeholder="이름, 연락처, 주소 검색" value="${esc(MF.q)}"></div>
-      <select class="inp" style="width:auto" data-mf="status">${opt([["활동", "활동 성도"], ["", "전체 상태"], ...ST().statuses, ["외부", "외부 헌금자"]], MF.status)}</select>
+      <select class="inp" style="width:auto" data-mf="status">${opt([["활동", "활동 성도"], ["", "전체 상태"], ...ST().statuses, ["외부", "외부 헌금자"], ["보관", `보관한 성도${arcN ? ` (${arcN})` : ""}`]], MF.status)}</select>
       <select class="inp" style="width:auto" data-mf="pos">${opt([["", "전체 직분"], ...ST().positions], MF.pos)}</select>
       <select class="inp" style="width:auto" data-mf="group">${opt([["", "전체 목장"], ...ST().groups], MF.group)}</select>
       <select class="inp" style="width:auto" data-mf="course">${opt([["", "양육 과정 전체"], ...ST().courses.map(c => [c, c + " 수료"]), ...ST().courses.map(c => ["!" + c, c + " 미수료"])], MF.course)}</select>
@@ -796,14 +899,16 @@ function memberRow(m) {
   const done = ST().courses.filter(c => (m.courses || {})[c]).length;
   const sel = MSEL.on;
   return `<div class="row" onclick="${sel ? `MemberUI.toggle('${m.id}',this)` : `MemberUI.open('${m.id}')`}">${sel ? `<input type="checkbox" ${MSEL.ids.has(m.id) ? "checked" : ""} style="width:20px;height:20px;pointer-events:none;flex:none">` : ""}<div class="avatar" style="background:${avColor(m.name)}">${esc((m.name || "?").slice(-2))}</div>
-  <div class="main"><div class="t">${esc(m.name)} ${m.pos ? `<span class="tag blue">${esc(m.pos)}</span>` : ""}${m.status && m.status !== "출석중" ? `<span class="tag ${m.status === "새가족" ? "green" : /출석중/.test(m.status) ? "blue" : "orange"}">${esc(m.status)}</span>` : ""}${m.kind === "외부" ? `<span class="tag">외부</span>` : ""}</div>
+  <div class="main"><div class="t">${esc(m.name)} ${m.pos ? `<span class="tag blue">${esc(m.pos)}</span>` : ""}${m.status && m.status !== "출석중" ? `<span class="tag ${m.status === "새가족" ? "green" : /출석중/.test(m.status) ? "blue" : "orange"}">${esc(m.status)}</span>` : ""}${m.kind === "외부" ? `<span class="tag">외부</span>` : ""}${m.archived ? `<span class="tag">보관</span>` : ""}</div>
   <div class="s">${[m.group, m.phone, m.birth ? `${m.birth.slice(0, 4)}년생 (${age(m.birth)}세)` : ""].filter(Boolean).map(esc).join(" · ")}</div></div>
   <div class="r">${done ? `<span class="tag green">양육 ${done}/${ST().courses.length}</span>` : ""}</div><span class="chev">›</span></div>`;
 }
 function filteredMembers() {
   const q = MF.q.trim().toLowerCase();
   let ms = members().filter(m => {
-    if (MF.status === "활동") { if (m.kind === "외부" || ["이명", "별세"].includes(m.status)) return false; }
+    if (MF.status === "보관") { if (!m.archived) return false; }
+    else if (m.archived) return false;
+    else if (MF.status === "활동") { if (m.kind === "외부" || ["이명", "별세"].includes(m.status)) return false; }
     else if (MF.status === "외부") { if (m.kind !== "외부") return false; }
     else if (MF.status && m.status !== MF.status) return false;
     if (MF.pos && m.pos !== MF.pos) return false;
@@ -825,7 +930,7 @@ const MemberUI = {
   detail(m) {
     const yr = new Date().getFullYear();
     const giving = offeringRows(`${yr}-01-01`, `${yr}-12-31`).filter(e => e.mid === m.id).reduce((s, e) => s + rowTotal(e), 0);
-    const dates = Object.keys(S.attendance).sort().reverse().slice(0, 12);
+    const dates = Object.keys(S.attendance).filter(attDone).sort().reverse().slice(0, 12);
     const attRate = dates.length ? Math.round(dates.filter(d => (S.attendance[d].present || []).includes(m.id)).length / dates.length * 100) : null;
     const body = `<div style="display:flex;align-items:center;gap:14px;margin-bottom:16px"><div class="avatar" style="background:${avColor(m.name)};width:60px;height:60px;font-size:20px">${esc(m.name.slice(-2))}</div>
       <div><div style="font-size:22px;font-weight:700">${esc(m.name)}</div><div class="hint">${[m.pos, m.group, m.status].filter(Boolean).map(esc).join(" · ")}</div></div></div>
@@ -839,10 +944,14 @@ const MemberUI = {
         <dt>가족</dt><dd>${esc(m.family || "-")}</dd><dt>영수증 성명</dt><dd>${esc(m.rname || m.name)}</dd>
         <dt>제자훈련</dt><dd>${ST().courses.map(c => `<span class="tag ${(m.courses || {})[c] ? "green" : ""}">${(m.courses || {})[c] ? "✓ " : ""}${esc(c)}</span>`).join(" ")}</dd>
         <dt>메모</dt><dd style="white-space:pre-wrap">${esc(m.memo || "-")}</dd></dl></div>`;
-    const ov = Sheet.open({ title: "성도 정보", body, foot: `<button class="btn danger" id="m-del" style="margin-right:auto">삭제</button><button class="btn" id="m-give">헌금 내역</button><button class="btn pri" id="m-edit">편집</button>` });
+    const ov = Sheet.open({ title: "성도 정보", body, foot: `<button class="btn danger" id="m-del" style="margin-right:auto">삭제</button><button class="btn" id="m-arch">${m.archived ? "보관 해제" : "보관"}</button><button class="btn" id="m-give">헌금 내역</button><button class="btn pri" id="m-edit">편집</button>` });
+    $("#m-arch", ov).onclick = () => {
+      if (m.archived) { const nx = { ...S.members[m.id], updated: today() }; delete nx.archived; delete nx.archivedAt; Store.set("members/" + m.id, nx); Sheet.close(); toast("보관을 풀었습니다"); return; }
+      Sheet.confirm(`<b>${esc(m.name)}</b> 성도를 보관할까요?<br><span class="hint">교적 목록·출석 체크·결석 알림에서 빠지고, <b>지난 헌금·출석 기록과 영수증은 그대로 남습니다.</b> 언제든 ‘보관한 성도’ 목록에서 해제할 수 있습니다.</span>`, () => { Store.set("members/" + m.id, { ...S.members[m.id], archived: true, archivedAt: today(), updated: today() }); Sheet.close(); toast("보관했습니다"); }, "보관");
+    };
     $("#m-edit", ov).onclick = () => this.edit(m);
     $("#m-give", ov).onclick = () => { Sheet.close(); RP.tab = "donor"; RP.donor = m.id; App.go("reports"); };
-    $("#m-del", ov).onclick = () => Sheet.confirm(`<b>${esc(m.name)}</b> 성도를 삭제할까요?<br><span class="hint">헌금·출석 기록은 남지만 이름 연결이 끊어집니다. 교회를 떠난 경우 ‘이명’ 상태로 바꾸는 것을 권합니다.</span>`, () => { Store.del("members/" + m.id); toast("삭제했습니다"); });
+    $("#m-del", ov).onclick = () => Sheet.confirm(`<b>${esc(m.name)}</b> 성도를 삭제할까요?<br><span class="hint">헌금 기록은 남지만 이름 연결이 끊어지고 되돌릴 수 없습니다. 교회를 떠났거나 나오지 않는 분은 삭제하지 말고 <b>‘보관’</b>하세요(기록이 모두 남고 언제든 해제 가능). 잘못 등록했거나 중복일 때만 삭제하세요.</span>`, () => { Store.del("members/" + m.id); toast("삭제했습니다"); });
   },
   edit(m) {
     const s = ST();
@@ -953,6 +1062,24 @@ function parseMemberSheet(ws, sheetName) {
 
 /* ========== 출석 체크 ========== */
 const AT = { date: null, mode: "check", month: null, group: "", way: "현장" };
+/* 입력 완료된 날짜만 통계에 센다. 예전 기록(done 표시 없음)은 완료로 본다. 새로 시작한 날은 done:false 로 시작해 ‘입력 완료’를 눌러야 센다 */
+const attDone = d => { const a = S.attendance[d]; return !!a && a.done !== false; };
+const attDoc = d => attDone(d) ? S.attendance[d] : undefined;
+const AttendUI = {
+  async setDone(d, v) {
+    const cur = S.attendance[d] || { date: d, present: [], visitors: 0, newcomers: 0, note: "" };
+    if (v && !(cur.present || []).length && !(+cur.visitors)) { toast("체크한 출석이 없습니다"); return; }
+    AT._tt = AT._tt || {}; clearTimeout(AT._tt[d]);
+    const doc = { ...structuredClone(cur), date: d, done: v }; if (v) doc.doneAt = new Date().toISOString();
+    S.attendance[d] = doc; const ok = await Store.set("attendance/" + d, doc);
+    if (ok === false) return; toast(v ? "출석 입력을 완료했습니다. 통계에 반영됩니다." : "다시 입력 중으로 바꿨습니다"); App.render();
+  },
+};
+function attNote(d) {
+  const a = S.attendance[d], done = !!a && a.done !== false;
+  if (done) return `<div class="banner" style="background:#eafaf0;color:#0b6b2e;border-color:#b6e8c8">✓ 입력 완료${a.doneAt ? ` · ${fmtAt(a.doneAt)}` : ""} — 홈·통계에 반영된 기록입니다. <button class="btn sm" onclick="AttendUI.setDone('${d}',false)">다시 입력 중으로</button></div>`;
+  return `<div class="banner" style="background:#eaf3ff;color:#0a4a8a;border-color:#b9d6f5">✎ <b>입력 중</b> — 모두 체크한 뒤 ‘입력 완료’를 눌러야 홈·출석 현황·결석 알림에 반영됩니다. <button class="btn sm pri" onclick="AttendUI.setDone('${d}',true)">입력 완료</button></div>`;
+}
 const atOnline = d => new Set(((S.attendance[d] || {}).online || []).filter(id => ((S.attendance[d] || {}).present || []).includes(id)));
 Views.attend = () => {
   AT.date = AT.date || lastSunday(); AT.month = AT.month || today().slice(0, 7);
@@ -962,14 +1089,14 @@ Views.attend = () => {
 function attendCheck(seg) {
   const d = AT.date, doc = S.attendance[d] || { date: d, present: [], visitors: 0, newcomers: 0, note: "" };
   const pres = new Set(doc.present || []);
-  const ms = members().filter(m => m.kind !== "외부" && !["이명", "별세"].includes(m.status) && (!m.reg || m.reg <= d || true));
+  const ms = members().filter(m => m.kind !== "외부" && !m.archived && !["이명", "별세"].includes(m.status) && (!m.reg || m.reg <= d || true));
   const away = ms.filter(m => m.status === "장기결석"), normal = ms.filter(m => m.status !== "장기결석");
   const groups = {}; for (const m of normal) (groups[m.group || "목장 미지정"] = groups[m.group || "목장 미지정"] || []).push(m);
   const order = [...ST().groups, "목장 미지정"].filter(g => groups[g]).concat(Object.keys(groups).filter(g => ![...ST().groups, "목장 미지정"].includes(g)));
   const onl = atOnline(d);
   const tile = (m, sub) => `<div class="att ${pres.has(m.id) ? "on" : ""} ${onl.has(m.id) ? "online" : ""}" data-mid="${m.id}" data-nm="${esc(m.name)}"><span class="ck">✓</span><div><div class="nm">${esc(m.name)} <span class="ob">온라인</span></div><div class="ps">${esc(sub)}</div></div></div>`;
   const total = pres.size + (+doc.visitors || 0);
-  return topBar("출석 체크", `${fmtD(d)} (${dow(d)}) 주일예배`, seg) + banner() +
+  return topBar("출석 체크", `${fmtD(d)} (${dow(d)}) 주일예배`, seg) + banner() + attNote(d) +
     `<div class="toolbar"><button class="icon-btn" onclick="AT.date=addDays(AT.date,-7);App.render()">‹</button>
       <input type="date" class="inp" style="width:auto" value="${d}" onchange="AT.date=this.value;App.render()">
       <button class="icon-btn" onclick="AT.date=addDays(AT.date,7);App.render()">›</button>
@@ -993,7 +1120,7 @@ function attendCheck(seg) {
 Views._after_attend = () => {
   if (AT.mode !== "check") return;
   const d = AT.date;
-  const cur = () => structuredClone(S.attendance[d] || { date: d, present: [], visitors: 0, newcomers: 0, note: "" });
+  const cur = () => structuredClone(S.attendance[d] || { date: d, present: [], visitors: 0, newcomers: 0, note: "", done: false });
   const save = doc => { doc.date = d; S.attendance[d] = doc; Store.keep("attendance/" + d, 3000); AT._tt = AT._tt || {}; clearTimeout(AT._tt[d]); AT._tt[d] = setTimeout(() => Store.set("attendance/" + d, S.attendance[d]), 500); refresh(); };
   const refresh = () => { const doc = S.attendance[d] || {}; const p = (doc.present || []).length, on = atOnline(d).size; $("#at-total").textContent = (p + (+doc.visitors || 0)) + "명"; $("#at-split").textContent = `현장 ${p - on}${+doc.visitors ? ` (+방문 ${+doc.visitors})` : ""} · 온라인 ${on}`; $("#at-n").textContent = `${p} / ${$$(".att").length}`; };
   $$(".att").forEach(el => el.onclick = () => {
@@ -1019,11 +1146,11 @@ function attendStats(seg) {
   const [y, m] = AT.month.split("-").map(Number);
   const sundays = []; const dd = new Date(y, m - 1, 1); while (dd.getDay() !== 0) dd.setDate(dd.getDate() + 1);
   while (dd.getMonth() === m - 1) { sundays.push(ymd(dd)); dd.setDate(dd.getDate() + 7); }
-  const ms = members().filter(x => x.kind !== "외부" && !["이명", "별세"].includes(x.status)).sort((a, b) => (a.group || "힣").localeCompare(b.group || "힣", "ko") || a.name.localeCompare(b.name, "ko"));
-  const has = (d, id) => S.attendance[d] && (S.attendance[d].present || []).includes(id);
-  const tot = d => S.attendance[d] ? (S.attendance[d].present || []).length + (+S.attendance[d].visitors || 0) : "";
+  const ms = members().filter(x => x.kind !== "외부" && !x.archived && !["이명", "별세"].includes(x.status)).sort((a, b) => (a.group || "힣").localeCompare(b.group || "힣", "ko") || a.name.localeCompare(b.name, "ko"));
+  const has = (d, id) => attDone(d) && (S.attendance[d].present || []).includes(id);
+  const tot = d => attDone(d) ? (S.attendance[d].present || []).length + (+S.attendance[d].visitors || 0) : "";
   // 연간 평균
-  const yrDates = Object.keys(S.attendance).filter(d => d.startsWith(y + "-")).sort();
+  const yrDates = Object.keys(S.attendance).filter(d => attDone(d) && d.startsWith(y + "-")).sort();
   const avg = yrDates.length ? Math.round(yrDates.reduce((s, d) => s + tot(d), 0) / yrDates.length) : 0;
   return topBar("출석 현황", `${y}년 ${m}월 · ${y}년 주일 평균 ${avg}명`, seg) +
     `<div class="toolbar"><button class="icon-btn" onclick="AT.month=shiftMonth(AT.month,-1);App.render()">‹</button><input type="month" class="inp" style="width:auto" value="${AT.month}" onchange="AT.month=this.value;App.render()"><button class="icon-btn" onclick="AT.month=shiftMonth(AT.month,1);App.render()">›</button>
@@ -1031,14 +1158,14 @@ function attendStats(seg) {
     <div class="card"><div class="tbl-wrap"><table class="tbl"><thead><tr><th>목장</th><th>이름</th><th>직분</th>${sundays.map(s => `<th class="n">${fmtMD(s)}</th>`).join("")}<th class="n">출석</th></tr></thead><tbody>
     ${ms.map(x => { const c = sundays.filter(s => has(s, x.id)).length; return `<tr><td class="muted">${esc(x.group || "")}</td><td>${esc(x.name)}</td><td class="muted">${esc(x.pos || "")}</td>${sundays.map(s => `<td class="n">${has(s, x.id) ? (atOnline(s).has(x.id) ? `<span style="color:var(--blue);font-weight:700" title="온라인">◆</span>` : `<span style="color:var(--green);font-weight:700">●</span>`) : S.attendance[s] ? `<span style="color:var(--faint)">○</span>` : ""}</td>`).join("")}<td class="n">${c}/${sundays.length}</td></tr>`; }).join("")}
     <tr class="sum"><td colspan="3">총 출석 (방문자 포함)</td>${sundays.map(s => `<td class="n">${tot(s)}</td>`).join("")}<td></td></tr>
-    <tr><td colspan="3" class="muted">온라인 출석 (◆)</td>${sundays.map(s => `<td class="n muted">${S.attendance[s] ? atOnline(s).size : ""}</td>`).join("")}<td></td></tr>
-    <tr><td colspan="3" class="muted">방문자 / 새가족</td>${sundays.map(s => `<td class="n muted">${S.attendance[s] ? `${+S.attendance[s].visitors || 0}/${+S.attendance[s].newcomers || 0}` : ""}</td>`).join("")}<td></td></tr>
+    <tr><td colspan="3" class="muted">온라인 출석 (◆)</td>${sundays.map(s => `<td class="n muted">${attDone(s) ? atOnline(s).size : S.attendance[s] ? "입력 중" : ""}</td>`).join("")}<td></td></tr>
+    <tr><td colspan="3" class="muted">방문자 / 새가족</td>${sundays.map(s => `<td class="n muted">${attDone(s) ? `${+S.attendance[s].visitors || 0}/${+S.attendance[s].newcomers || 0}` : ""}</td>`).join("")}<td></td></tr>
     </tbody></table></div></div>`;
 }
 const shiftMonth = (ym, n) => { const [y, m] = ym.split("-").map(Number); const d = new Date(y, m - 1 + n, 1); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}`; };
 function exportAttendance(ym) {
-  const y = +ym.slice(0, 4); const dates = Object.keys(S.attendance).filter(d => d.startsWith(y + "-")).sort();
-  const ms = members().filter(x => x.kind !== "외부").sort((a, b) => (a.group || "힣").localeCompare(b.group || "힣", "ko") || a.name.localeCompare(b.name, "ko"));
+  const y = +ym.slice(0, 4); const dates = Object.keys(S.attendance).filter(d => attDone(d) && d.startsWith(y + "-")).sort();
+  const ms = members().filter(x => x.kind !== "외부" && !x.archived).sort((a, b) => (a.group || "힣").localeCompare(b.group || "힣", "ko") || a.name.localeCompare(b.name, "ko"));
   const rows = [["목장", "이름", "직분", "상태", ...dates.map(fmtMD), "출석 수"]];
   for (const m of ms) { const r = dates.map(d => (S.attendance[d].present || []).includes(m.id) ? (atOnline(d).has(m.id) ? "온" : "o") : "x"); rows.push([m.group, m.name, m.pos, m.status, ...r, r.filter(v => v !== "x").length]); }
   rows.push(["", "총 출석", "", "", ...dates.map(d => (S.attendance[d].present || []).length + (+S.attendance[d].visitors || 0))]);
@@ -1054,7 +1181,7 @@ function selBar() {
   if (!MSEL.on) return "";
   return `<div class="card" style="margin-bottom:14px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:12px 16px"><b id="msel-n">0명 선택</b>
   <button class="btn sm" onclick="MemberUI.selAll()">현재 목록 모두 선택</button><button class="btn sm" onclick="MemberUI.selNone()">선택 해제</button><span style="flex:1"></span>
-  <button class="btn sm" id="msel-merge" onclick="MemberUI.mergeSel()">하나로 합치기</button><button class="btn sm danger" id="msel-del" onclick="MemberUI.delSel()">선택 삭제</button></div>`;
+  <button class="btn sm" id="msel-merge" onclick="MemberUI.mergeSel()">하나로 합치기</button><button class="btn sm" id="msel-arch" onclick="MemberUI.archSel()">선택 보관</button><button class="btn sm danger" id="msel-del" onclick="MemberUI.delSel()">선택 삭제</button></div>`;
 }
 function findDupGroups() {
   const by = {};
@@ -1122,10 +1249,16 @@ Object.assign(MemberUI, {
   selUpdate() {
     MSEL.ids = new Set([...MSEL.ids].filter(id => S.members[id])); const n = MSEL.ids.size;
     const el = $("#msel-n"); if (el) el.textContent = `${n}명 선택`;
-    const mg = $("#msel-merge"), dl = $("#msel-del"); if (mg) mg.disabled = n < 2; if (dl) dl.disabled = n < 1;
+    const mg = $("#msel-merge"), dl = $("#msel-del"), ar = $("#msel-arch"); if (mg) mg.disabled = n < 2; if (dl) dl.disabled = n < 1; if (ar) ar.disabled = n < 1;
   },
   selAll() { filteredMembers().forEach(m => MSEL.ids.add(m.id)); App.render(); },
   selNone() { MSEL.ids.clear(); App.render(); },
+  archSel() {
+    this.selUpdate(); const ids = [...MSEL.ids]; if (!ids.length) return;
+    const names = ids.slice(0, 5).map(mName).join(", ") + (ids.length > 5 ? ` 외 ${ids.length - 5}명` : "");
+    Sheet.confirm(`<b>${ids.length}명</b>을 보관할까요?<br><span class="hint">${esc(names)}<br>교적 목록·출석 체크에서 빠지고, 헌금·출석 기록과 영수증은 그대로 남습니다. ‘보관한 성도’ 목록에서 언제든 해제할 수 있습니다.</span>`,
+      async () => { for (const id of ids) await Store.set("members/" + id, { ...S.members[id], archived: true, archivedAt: today(), updated: today() }); MSEL.ids.clear(); toast(`${ids.length}명을 보관했습니다`); }, "보관");
+  },
   delSel() {
     this.selUpdate(); const ids = [...MSEL.ids]; if (!ids.length) return;
     const set = new Set(ids); let giv = 0; for (const doc of Object.values(S.offerings)) for (const e of doc.entries || []) if (set.has(e.mid)) giv++;
@@ -1195,6 +1328,7 @@ function ofSave(now) {
   OF.dirty = true; clearTimeout(OF.saveT); clearTimeout(OF.retryT); ofState("saving");
   const run = async () => {
     const doc = OF.draft, date = OF.draftDate; doc.entries = doc.entries.filter(e => e.mid || e.name || rowTotal(e));
+    if (Lock.check("offerings", date, doc)) { Lock.warn(date); OF.draft = null; OF.dirty = false; OF.failed = false; ofBase(S.offerings[date]); App.render(); return; }
     /* 다른 기기에서 이 날짜가 먼저 바뀌었으면 덮어쓰지 말고 합친다 */
     const live = S.offerings[date]; let merged = 0;
     if (live && (live.updated || "") !== OF.baseU) { merged = ofMerge(doc, live); }
@@ -1230,7 +1364,7 @@ Views.offer = () => {
   const showAll = OF.allCols;
   const cols = showAll ? types : usedTypes;
   return topBar("헌금 입력", `${fmtD(d)} (${dow(d)}) · ${doc.entries.length}건 · 합계 ${wonU(grand)}`,
-    `<span class="hint" id="of-state"${OF.failed ? ` style="color:var(--red);cursor:pointer;font-weight:700" onclick="OF.retries=0;ofSave(true)"` : ""}>${OF.failed ? "⚠ 저장 실패 — 눌러서 다시 시도" : OF.dirty ? "저장 중…" : "자동 저장"}</span><button class="btn" onclick="OfferUI.importDlg()">엑셀 가져오기</button><button class="btn" onclick="OfferUI.countSheet()">계수 보고서</button>`) + banner() +
+    `<span class="hint" id="of-state"${OF.failed ? ` style="color:var(--red);cursor:pointer;font-weight:700" onclick="OF.retries=0;ofSave(true)"` : ""}>${OF.failed ? "⚠ 저장 실패 — 눌러서 다시 시도" : OF.dirty ? "저장 중…" : "자동 저장"}</span><button class="btn" onclick="OfferUI.importDlg()">엑셀 가져오기</button><button class="btn" onclick="OfferUI.countSheet()">계수 보고서</button>`) + banner() + Lock.note(d) +
     `<div class="toolbar"><button class="icon-btn" onclick="OfferUI.move(-7)">‹</button>
       <input type="date" class="inp" style="width:auto" value="${d}" onchange="OfferUI.setDate(this.value)">
       <button class="icon-btn" onclick="OfferUI.move(7)">›</button><button class="btn sm" onclick="OfferUI.setDate(lastSunday())">이번 주일</button></div>
@@ -1260,8 +1394,9 @@ Views.offer = () => {
 };
 Views._after_offer = () => {
   const g = $("#of-grid"); if (g && innerWidth < 1000) g.style.gridTemplateColumns = "1fr";
+  if (Lock.closed(OF.date)) { $$("#qa-name,#qa-type,#qa-amt,#qa-memo,#qa-add,.oe input,[data-del]").forEach(e => { e.disabled = true; }); $$("button").forEach(b => { if (/빈 줄 추가/.test(b.textContent)) b.disabled = true; }); }
   const nm = $("#qa-name"), ty = $("#qa-type"), am = $("#qa-amt"), mo = $("#qa-memo");
-  Autocomplete(nm, q => members().filter(m => m.name.includes(q)).sort((a, b) => a.name.localeCompare(b.name, "ko")).slice(0, 8).map(m => ({ v: m.name, id: m.id, s: [m.pos, m.kind === "외부" ? "외부" : m.group].filter(Boolean).join(" · ") })), it => { nm.dataset.mid = it.id; am.focus(); });
+  Autocomplete(nm, q => members().filter(m => m.name.includes(q)).sort((a, b) => a.name.localeCompare(b.name, "ko")).slice(0, 8).map(m => ({ v: m.name, id: m.id, s: [m.pos, m.kind === "외부" ? "외부" : m.group, m.archived ? "보관" : ""].filter(Boolean).join(" · ") })), it => { nm.dataset.mid = it.id; am.focus(); });
   nm.oninput = () => { delete nm.dataset.mid; };
   $$("#qa-types .chip").forEach(c => c.onclick = () => { OF.type = c.dataset.t; ty.value = OF.type; $$("#qa-types .chip").forEach(x => x.classList.toggle("on", x === c)); am.focus(); });
   ty.onchange = () => { OF.type = ty.value; $$("#qa-types .chip").forEach(x => x.classList.toggle("on", x.dataset.t === OF.type)); };
@@ -1287,8 +1422,9 @@ const OfferUI = {
   setDate(d) { if (OF.dirty) ofSave(true); OF.date = d; OF.draft = null; App.render(); },
   move(n) { this.setDate(addDays(OF.date, n)); },
   softTotals() { clearTimeout(this._t); this._t = setTimeout(() => { if (!App.busy()) App.render(); else App._pend = true; }, 400); },
-  addBlank() { ofDoc().entries.push({ id: uid(), mid: "", name: "", a: {} }); App.render(); },
+  addBlank() { if (Lock.closed(OF.date)) { Lock.warn(OF.date); return; } ofDoc().entries.push({ id: uid(), mid: "", name: "", a: {} }); App.render(); },
   quickAdd(name, mid, type, amt, memo) {
+    if (Lock.closed(OF.date)) { Lock.warn(OF.date); return; }
     if (!name) { toast("헌금자 이름을 입력하세요"); $("#qa-name").focus(); return; }
     if (!amt) { toast("금액을 입력하세요"); $("#qa-amt").focus(); return; }
     if (!mid) { const m = members().find(x => x.name === name); if (m) mid = m.id; }
@@ -1354,15 +1490,16 @@ const OfferUI = {
     };
     $("#ox-go", ov).onclick = async ev => {
       if (OfferUI._busy) return; OfferUI._busy = true; ev.target.disabled = true; ev.target.textContent = "가져오는 중…";
-      const addAll = !!($("#ox-add", ov) && $("#ox-add", ov).checked); let skipped = 0, failed = 0;
+      const addAll = !!($("#ox-add", ov) && $("#ox-add", ov).checked); let skipped = 0, failed = 0, locked = 0;
       for (const [d, ents] of Object.entries(byDate)) {
+        if (Lock.closed(d)) { locked++; continue; }
         if (!addAll && (S.offerings[d] || {}).entries && S.offerings[d].entries.length) { skipped++; continue; }
         const doc = structuredClone(S.offerings[d] || { date: d, entries: [] });
         for (const e of ents) { const ex = doc.entries.find(x => (e.mid && x.mid === e.mid) || (!e.mid && x.name === e.name)); if (ex) { for (const [t, v] of Object.entries(e.a)) ex.a[t] = (+ex.a[t] || 0) + v; } else doc.entries.push(e); }
         doc.updated = new Date().toISOString();
         if ((await Store.set("offerings/" + d, doc)) === false) failed++;
       }
-      OF.draft = null; Sheet.close(); toast(failed ? `${failed}개 주일을 저장하지 못했습니다. 다시 시도해 주세요.` : skipped ? `헌금 기록을 가져왔습니다 (이미 입력된 ${skipped}개 주일은 건너뜀)` : "헌금 기록을 가져왔습니다");
+      OF.draft = null; Sheet.close(); toast(failed ? `${failed}개 주일을 저장하지 못했습니다. 다시 시도해 주세요.` : locked ? `헌금 기록을 가져왔습니다 (마감된 ${locked}개 주는 건너뜀)` : skipped ? `헌금 기록을 가져왔습니다 (이미 입력된 ${skipped}개 주일은 건너뜀)` : "헌금 기록을 가져왔습니다");
     };
   },
 };
@@ -1500,7 +1637,7 @@ const ExpenseUI = {
     const s = ST();
     const itemOpts = s.cats.map(c => `<optgroup label="${esc(c.name)}">${c.items.map(i => `<option value="${i.id}" ${i.id === r.itemId ? "selected" : ""}>${esc(i.name)}${i.sep ? " (별도통장)" : ""}</option>`).join("")}</optgroup>`).join("");
     const payees = [...new Set(expenseRows().map(x => x.payee).filter(Boolean))].slice(-200);
-    const body = `<form id="xf" onsubmit="return false"><div class="group">
+    const body = `${id && Lock.closed(r.date) ? `<div class="hint" style="color:var(--red);margin-bottom:8px">🔒 마감된 주의 지출입니다. 고치거나 지우려면 먼저 주간 마감을 해제하세요.</div>` : ""}<form id="xf" onsubmit="return false"><div class="group">
       <div class="fr"><div class="field"><label>날짜 *</label><input class="inp" type="date" name="date" value="${esc(r.date)}"></div>
       <div class="field"><label>금액 *</label><input class="inp money" name="amount" inputmode="numeric" placeholder="예: 32,000 또는 3.2만" value="${r.amount ? won(r.amount) : ""}"></div></div>
       <div class="field"><label>예산 항목 *</label><select class="inp" name="itemId">${itemOpts}</select></div>
@@ -1521,6 +1658,7 @@ const ExpenseUI = {
       if (!d.date || !d.amount || !d.itemId) { toast("날짜·금액·항목을 입력하세요"); return; }
       const it = itemById(d.itemId); d.cat = it.cat; d.item = it.name; if (!d.sub || !(it.subs || []).includes(d.sub)) delete d.sub;
       const nym = d.date.slice(0, 7);
+      { const lk = [id && !asNew ? r.date : "", d.date].filter(Boolean).find(x => Lock.closed(x)); if (lk) { Lock.warn(lk); return; } }
       if (id && !asNew && ym !== nym) { const old = structuredClone(S.expenses[ym]); old.items = old.items.filter(x => x.id !== id); await (old.items.length ? Store.set("expenses/" + ym, old) : Store.del("expenses/" + ym)); }
       const nd = structuredClone(S.expenses[nym] || { ym: nym, items: [] });
       const rec = { ...d, id: (id && !asNew) ? id : uid(), ym: nym };
@@ -1534,7 +1672,7 @@ const ExpenseUI = {
     $("#x-save", ov).onclick = () => save(false);
     if (id) {
       $("#x-dup", ov).onclick = () => save(true);
-      $("#x-del", ov).onclick = () => Sheet.confirm("이 지출 기록을 삭제할까요?", async () => { const nd = structuredClone(S.expenses[ym]); nd.items = nd.items.filter(x => x.id !== id); await (nd.items.length ? Store.set("expenses/" + ym, nd) : Store.del("expenses/" + ym)); toast("삭제했습니다"); });
+      $("#x-del", ov).onclick = () => Sheet.confirm("이 지출 기록을 삭제할까요?", async () => { if (Lock.closed(r.date)) { Lock.warn(r.date); return; } const nd = structuredClone(S.expenses[ym]); nd.items = nd.items.filter(x => x.id !== id); await (nd.items.length ? Store.set("expenses/" + ym, nd) : Store.del("expenses/" + ym)); toast("삭제했습니다"); });
     }
   },
   exportX() {
@@ -1571,9 +1709,10 @@ const ExpenseUI = {
     };
     $("#xx-go", ov).onclick = async ev => {
       if (ExpenseUI._busy) return; ExpenseUI._busy = true; ev.target.disabled = true; ev.target.textContent = "가져오는 중…";
+      const nLock = recs.filter(r => Lock.closed(r.date)).length; recs = recs.filter(r => !Lock.closed(r.date));
       const by = {}; for (const r of recs) (by[r.ym] = by[r.ym] || []).push(r);
       for (const [ym, list] of Object.entries(by)) { const nd = structuredClone(S.expenses[ym] || { ym, items: [] }); nd.items.push(...list); nd.items.sort((a, b) => a.date < b.date ? -1 : 1); await Store.set("expenses/" + ym, nd); }
-      Sheet.close(); toast(`${recs.length}건을 가져왔습니다`);
+      Sheet.close(); toast(`${recs.length}건을 가져왔습니다${nLock ? ` (마감된 주의 ${nLock}건은 제외)` : ""}`);
     };
   },
 };
@@ -1720,7 +1859,7 @@ function yearlyModel() {
   const s2 = { h: "지출 (회계연도별)", head: ["항목", ...years.map(String)], rows: ST().cats.map(c => ({ cells: [c.name, ...years.map(y => +ex[y][c.name] || 0)] })) };
   s2.rows.push({ cls: "sum", cells: ["지출 합계", ...years.map(y => sum(ex[y]))] });
   s2.rows.push({ cells: ["지출 전년 대비", ...years.map((y, i) => i && sum(ex[years[i - 1]]) ? ((sum(ex[y]) / sum(ex[years[i - 1]]) - 1) * 100).toFixed(1) + "%" : "")] });
-  const s3 = { h: "출석 (연평균)", head: ["구분", ...years.map(String)], rows: [{ cells: ["주일 평균 출석", ...years.map(y => { const ds = Object.keys(S.attendance).filter(d => FY.of(d) === y); return ds.length ? Math.round(ds.reduce((s, d) => s + (S.attendance[d].present || []).length + (+S.attendance[d].visitors || 0), 0) / ds.length) : ""; })] }] };
+  const s3 = { h: "출석 (연평균)", head: ["구분", ...years.map(String)], rows: [{ cells: ["주일 평균 출석", ...years.map(y => { const ds = Object.keys(S.attendance).filter(d => attDone(d) && FY.of(d) === y); return ds.length ? Math.round(ds.reduce((s, d) => s + (S.attendance[d].present || []).length + (+S.attendance[d].visitors || 0), 0) / ds.length) : ""; })] }] };
   return { title: `${CH()} 수입 및 지출 연도별 비교표`, sub: `${years[0]} ~ ${cur} 회계연도 (상세 기록이 없는 해는 과거 결산 합계 사용)`, sections: [s1, s2, s3] };
 }
 function donorModel(year, mode) {
@@ -2138,10 +2277,10 @@ const AttRP = {
   st: { fy: null, sp: false, view: "all", grp: "", sort: "rate", sel: "" },
   calc(fy, sp) {
     const [a, b] = FY.range(fy);
-    const dates = Object.keys(S.attendance).filter(d => d >= a && d <= b && (sp || parseD(d).getDay() === 0)).sort();
+    const dates = Object.keys(S.attendance).filter(d => attDone(d) && d >= a && d <= b && (sp || parseD(d).getDay() === 0)).sort();
     const rows = [];
     for (const m of members()) {
-      if (m.kind === "외부") continue;
+      if (m.kind === "외부" || m.archived) continue;
       const att = dates.filter(d => (S.attendance[d].present || []).includes(m.id));
       if (!att.length && !(/출석중/.test(m.status || "") || m.status === "새가족")) continue;
       let start = m.reg && m.reg >= a && m.reg <= b ? m.reg : a;
@@ -2442,6 +2581,7 @@ Views.settings = () => {
     body = `<div class="card"><h3>저장 상태</h3><div class="hint">${Store.mode === "cloud" ? "클라우드 저장소에 저장되어 PC와 모바일에서 같은 자료를 봅니다. 이 앱의 소유자와 편집 권한을 받은 사람만 자료를 읽고 쓸 수 있습니다." : "미리보기 모드: 이 브라우저에만 임시 저장됩니다."}</div>
       <div class="grid g4 mt">${Object.entries(n).map(([k, v]) => `<div class="stat"><div class="l">${k}</div><div class="v">${v}</div></div>`).join("")}</div><div class="hint mt">저장 문서 ${docs} / 25,000개 사용 (헌금은 주일당 1개, 지출은 월당 1개로 묶어 저장하므로 수십 년 사용해도 충분합니다)</div></div>
       ${AutoBackup.card()}
+      ${Restore.card()}
       <div class="card"><h3>백업과 복원</h3><div class="hint mb">한 달에 한 번 전체 백업 파일을 받아 구글 드라이브 ‘회계자료’ 폴더에 보관하세요.</div>
       <div class="actions"><button class="btn pri" onclick="Backup.json()">전체 백업 (JSON)</button><button class="btn" onclick="Backup.xlsx()">전체 자료 엑셀</button><label class="btn">백업 파일로 복원<input type="file" accept=".json" style="display:none" onchange="Backup.restore(this.files[0])"></label></div></div>
       <div class="card"><h3>연도별 비교표 <small>보고서 · 통계</small></h3><div class="hint">앱에 입력한 헌금과 지출 기록으로 연도별 비교표가 만들어집니다. 엑셀 가져오기로 지난 기록을 넣으면 그 해도 함께 비교됩니다.</div></div>`;
@@ -2530,6 +2670,92 @@ const Backup = {
       for (const c of COLS) for (const [id, v] of Object.entries(d[c] || {})) await Store.set(`${c}/${id}`, v);
       SE.draft = null; toast("복원했습니다");
     }, "복원");
+  },
+};
+
+/* ========== 복구 지점 ==========
+   - 하루의 첫 변경 직전 상태를 자동으로 보관(최근 60일), 수동 지점과 복원 직전 지점은 각각 최근 20개.
+   - 자료 전체를 압축해 snaps/<id>(설명)와 snapdata/<id>_<n>(내용 조각)에 저장합니다. 복원은 그 시점으로 '전체 교체'입니다. */
+const Restore = {
+  list: [], loaded: false, busy: false, _day: "", _att: false, CH: 150000, KEEP: { d: 60, m: 20, r: 20 },
+  attach() {
+    if (this._att || !Store.db) return; this._att = true;
+    Store.db.collection("snaps").onSnapshot(qs => {
+      this.list = qs.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => String(b.at).localeCompare(String(a.at)));
+      if (!qs.metadata.fromCache) this.loaded = true;
+      if (typeof App !== "undefined" && App.view === "settings" && SE.tab === "data") App.changed();
+    }, () => { });
+  },
+  ready() { return Store.mode === "cloud" && Store.sLoaded && App.isReady && !Store.err && this.loaded && !this.busy; },
+  pack() { let docs = 0; const o = { settings: S.settings }; for (const c of COLS) { o[c] = S[c]; docs += Object.keys(S[c] || {}).length; } return { json: JSON.stringify(o), docs }; },
+  /* 저장(쓰기) 직전에 불린다: 오늘 첫 변경이면 변경 전 상태를 한 번 보관 */
+  beforeWrite() {
+    try {
+      const id = "d" + today().replace(/-/g, "");
+      if (!this.ready() || this._day === id || this.list.some(x => x.id === id)) return;
+      this._day = id;
+      const pk = this.pack();
+      this.write(id, "자동", pk).catch(() => { this._day = ""; });
+    } catch (e) { }
+  },
+  async write(id, label, pk) {
+    const z = await AutoBackup.pack(pk.json), parts = [];
+    for (let i = 0; i < z.text.length; i += this.CH) parts.push(z.text.slice(i, i + this.CH));
+    for (let i = 0; i < parts.length; i++) await Store.db.doc("snapdata/" + id + "_" + i).set({ t: parts[i] });
+    await Store.db.doc("snaps/" + id).set({ at: new Date().toISOString(), label, enc: z.enc, n: parts.length, len: pk.json.length, docs: pk.docs });
+    this.prune().catch(() => { });
+  },
+  async prune() {
+    const by = {}; for (const x of this.list) (by[x.id[0]] = by[x.id[0]] || []).push(x);
+    for (const [k, arr] of Object.entries(by)) {
+      const keep = this.KEEP[k] || 20;
+      for (const x of arr.slice(keep)) {
+        for (let i = 0; i < (x.n || 1); i++) await Store.db.doc("snapdata/" + x.id + "_" + i).delete().catch(() => { });
+        await Store.db.doc("snaps/" + x.id).delete().catch(() => { });
+      }
+    }
+  },
+  async manual() {
+    if (!this.ready()) { toast("지금은 복구 지점을 만들 수 없습니다 (서버 연결·불러오기 확인)"); return; }
+    try { await this.write("m" + Date.now().toString(36), "수동", this.pack()); toast("복구 지점을 만들었습니다"); } catch (e) { toast("복구 지점을 만들지 못했습니다"); }
+  },
+  async load(id) {
+    const m = this.list.find(x => x.id === id); if (!m) throw new Error("missing");
+    let text = ""; for (let i = 0; i < (m.n || 1); i++) { const d = await Store.db.doc("snapdata/" + id + "_" + i).get(); if (!d.exists) throw new Error("part"); text += d.data().t; }
+    return JSON.parse(await AutoBackup.unpack(text, m.enc));
+  },
+  ask(id) {
+    const m = this.list.find(x => x.id === id); if (!m) return;
+    Sheet.confirm(`<b>${fmtAt(m.at)}</b> 시점(${esc(m.label)})으로 <b>전체를 되돌릴까요?</b><br><span class="hint">설정과 성도·헌금·출석·지출·영수증·마감 기록이 그 시점의 모습으로 바뀝니다. 그 뒤에 입력한 내용은 사라지지만, 복원 직전 상태도 ‘복원 직전’ 지점으로 자동 보관되어 다시 되돌릴 수 있습니다.</span>`, () => this.apply(id), "복원");
+  },
+  async apply(id) {
+    if (!this.ready()) { toast("지금은 복원할 수 없습니다 (서버 연결 확인)"); return; }
+    this.busy = true;
+    try {
+      toast("복원 준비 중… 현재 상태를 먼저 보관합니다");
+      await this.write("r" + Date.now().toString(36), "복원 직전", this.pack());
+      const snap = await this.load(id);
+      toast("복원하는 중… 이 화면을 닫지 마세요");
+      if (snap.settings) await Store.writeSettings(() => structuredClone(snap.settings));
+      let n = 0, del = 0;
+      for (const c of COLS) {
+        const want = snap[c] || {};
+        for (const [k, v] of Object.entries(want)) if (JSON.stringify(S[c][k]) !== JSON.stringify(v)) { if ((await Store.set(`${c}/${k}`, v, { force: true })) === false) throw new Error("save"); n++; }
+        for (const k of Object.keys(S[c])) if (!(k in want)) { if ((await Store.del(`${c}/${k}`, { force: true })) === false) throw new Error("del"); del++; }
+      }
+      SE.draft = null; OF.draft = null;
+      toast(`복원했습니다 (바꾼 문서 ${n}개, 지운 문서 ${del}개)`);
+    } catch (e) { toast("복원 중 문제가 생겼습니다. ‘복원 직전’ 지점으로 되돌릴 수 있습니다."); }
+    finally { this.busy = false; App.render(); }
+  },
+  card() {
+    if (Store.mode !== "cloud") return `<div class="card"><h3>복구 지점</h3><div class="hint">클라우드 저장소에서 앱을 열었을 때만 쓸 수 있습니다.</div></div>`;
+    const lab = { d: "자동", m: "수동", r: "복원 직전" };
+    const rows = this.list.slice(0, 30).map(x => `<div class="row" style="padding:8px 4px"><div class="main"><div class="t">${fmtAt(x.at)} <span class="tag ${x.id[0] === "d" ? "" : x.id[0] === "m" ? "blue" : "orange"}">${esc(x.label || lab[x.id[0]] || "")}</span></div><div class="s">문서 ${x.docs ?? "-"}개</div></div><button class="btn sm" onclick="Restore.ask('${x.id}')">이 시점으로 복원</button></div>`).join("");
+    return `<div class="card"><h3>복구 지점 <small>실수했을 때 되돌리는 안전장치</small></h3>
+      <div class="hint mb">하루의 첫 변경 직전 상태가 자동으로 보관됩니다(최근 60일). 큰 정리(성도 합치기·엑셀 가져오기 등) 전에는 ‘지금 복구 지점 만들기’를 눌러 두세요. 복원하면 그 시점으로 <b>전체</b>가 되돌아갑니다.</div>
+      <div class="actions mb"><button class="btn pri" onclick="Restore.manual()">지금 복구 지점 만들기</button></div>
+      ${!this.loaded ? `<div class="hint">불러오는 중…</div>` : rows ? `<div class="list" style="max-height:340px;overflow:auto">${rows}</div>${this.list.length > 30 ? `<div class="hint mt">최근 30개만 표시합니다.</div>` : ""}` : `<div class="hint">아직 보관된 지점이 없습니다. 오늘 처음 자료를 바꾸면 자동으로 만들어집니다.</div>`}</div>`;
   },
 };
 
