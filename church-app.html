@@ -364,7 +364,7 @@ const FY = {
 const ymKey = (y, m) => `${y}-${pad(m)}`;
 
 /* ========== 기본 설정 ========== */
-const APP_VERSION = "1.2.1", APP_DATE = "2026-11-10", APP_EDITION = "구독자 배포판";
+const APP_VERSION = "1.3.0", APP_DATE = "2026-11-15", APP_EDITION = "구독자 배포판";
 const MAKER = { church: "다시본교회", pastor: "주진규 목사", home: "https://dasibon.icg21.com/", bulletin: "https://dasibon-church.jinkyuju.workers.dev/", youtube: "https://www.youtube.com/@dasibon", releases: "https://github.com/dasibon-app/church-app/releases/latest" };
 const makerHtml = () => `<b>${MAKER.church}</b> ${MAKER.pastor}가 작은 교회를 위해 만들어 무료로 나눕니다.<br>
   <a href="${MAKER.home}" target="_blank" rel="noopener noreferrer">교회 홈페이지</a> · <a href="${MAKER.bulletin}" target="_blank" rel="noopener noreferrer">웹주보</a> · <a href="${MAKER.youtube}" target="_blank" rel="noopener noreferrer">유튜브</a>`;
@@ -1655,8 +1655,49 @@ function attendCheck(seg) {
       (away.length ? `<div class="card" style="margin-bottom:14px"><h3>장기결석자 <span><small>${away.filter(m => pres.has(m.id)).length}/${away.length}명 · 다시 나오신 분은 여기서 체크</small></span></h3>
       <div class="att-grid">${away.sort((a, b) => (a.group || "힣").localeCompare(b.group || "힣", "ko") || a.name.localeCompare(b.name, "ko")).map(m => tile(m, [m.group, m.pos].filter(Boolean).join(" · "))).join("")}</div></div>` : "") :
       `<div class="card empty"><div class="e">✓</div>성도 교적을 먼저 등록하면 이름을 눌러 출석을 체크할 수 있습니다.</div>`}
+    ${guestCard(d, doc)}
     <div class="card"><h3>예배 메모</h3><textarea class="inp" id="at-note" rows="2" placeholder="설교 본문, 특이사항 등">${esc(doc.note || "")}</textarea></div>`;
 }
+/* 방문자 이름 기록: attendance/<날짜>.guests = [{id,name}] — 방문자 수(visitors)에는 이름을 적을 때마다 +1 되어 기존 통계가 그대로 맞는다 */
+const guestCard = (d, doc) => {
+  const gs = doc.guests || [], un = Math.max(0, (+doc.visitors || 0) - gs.length);
+  return `<div class="card" style="margin-bottom:14px"><h3>방문자 이름 기록 <span><small>교적에 없는 분 · 이름 ${gs.length}명${un ? ` + 이름 없이 ${un}명` : ""}</small></span></h3>
+  <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center"><input class="inp" id="ag-name" placeholder="방문자 이름" autocomplete="off" style="flex:1;min-width:160px" onkeydown="if(event.key==='Enter'&&!event.isComposing){event.preventDefault();AttGuest.add()}"><button class="btn pri" onclick="AttGuest.add()">방문자 추가</button></div>
+  ${gs.length ? `<div style="margin-top:10px;display:flex;flex-wrap:wrap">${gs.map(g => `<span class="tag green" style="margin:0 8px 8px 0;padding:6px 10px;font-size:14px">✓ ${esc(g.name)} <a href="#" onclick="AttGuest.promote('${g.id}');return false" style="margin-left:6px">교적 등록</a> <a href="#" onclick="AttGuest.del('${g.id}');return false" style="margin-left:4px" title="삭제">✕</a></span>`).join("")}</div>` : ""}
+  <div class="hint" style="margin-top:6px">이름을 적으면 바로 출석(방문자 수 +1)으로 기록됩니다. 계속 나오시는 분은 ‘교적 등록’을 눌러 새가족으로 옮기세요.</div></div>`;
+};
+const AttGuest = {
+  doc() { return structuredClone(S.attendance[AT.date] || { date: AT.date, present: [], visitors: 0, newcomers: 0, note: "", done: false }); },
+  async put(doc) {
+    const d = AT.date; doc.date = d; AT._tt = AT._tt || {}; clearTimeout(AT._tt[d]);
+    S.attendance[d] = doc; const r = await Store.set("attendance/" + d, doc);
+    if (r === false) return false; App.render(); return true;
+  },
+  async add() {
+    const el = $("#ag-name"), name = (el && el.value || "").trim();
+    if (!name) { toast("방문자 이름을 입력해 주세요"); el && el.focus(); return; }
+    if (members().some(m => normName(m.name) === normName(name))) { toast(`${name} 님은 교적에 있습니다. 위의 명단에서 이름을 눌러 체크해 주세요`); return; }
+    const doc = this.doc(); doc.guests = doc.guests || [];
+    if (doc.guests.some(g => normName(g.name) === normName(name))) { toast(`${name} 님은 이미 기록되어 있습니다`); return; }
+    doc.guests.push({ id: uid(), name }); doc.visitors = (+doc.visitors || 0) + 1;
+    if (await this.put(doc)) { toast(`${name} 님을 방문자로 기록했습니다`); setTimeout(() => { const n = $("#ag-name"); n && n.focus(); }, 30); }
+  },
+  async del(id) {
+    const doc = this.doc(), g = (doc.guests || []).find(x => x.id === id); if (!g) return;
+    doc.guests = doc.guests.filter(x => x.id !== id); if (!doc.guests.length) delete doc.guests;
+    doc.visitors = Math.max(0, (+doc.visitors || 0) - 1);
+    if (await this.put(doc)) toast(`${g.name} 님을 방문자 기록에서 뺐습니다`);
+  },
+  async promote(id) {
+    const doc = this.doc(), g = (doc.guests || []).find(x => x.id === id); if (!g) return;
+    const mid = uid(), r = await Store.set("members/" + mid, { name: g.name, kind: "내부", status: "새가족", reg: AT.date, courses: {}, updated: today() });
+    if (r === false) return;
+    doc.guests = doc.guests.filter(x => x.id !== id); if (!doc.guests.length) delete doc.guests;
+    doc.visitors = Math.max(0, (+doc.visitors || 0) - 1);
+    doc.present = [...new Set([...(doc.present || []), mid])]; if (AT.way === "온라인") doc.online = [...(doc.online || []), mid];
+    if (await this.put(doc)) toast(`${g.name} 님을 새가족으로 등록하고 출석 처리했습니다`);
+  },
+};
 Views._after_attend = () => {
   if (AT.mode !== "check") return;
   const d = AT.date;
@@ -1677,7 +1718,7 @@ Views._after_attend = () => {
     doc.present = [...s]; doc.online = [...o].filter(x => s.has(x)); save(doc);
   });
   const vis = $("#at-vis"), nw = $("#at-new"), note = $("#at-note");
-  if (vis) vis.onchange = () => { const doc = cur(); doc.visitors = +vis.value || 0; save(doc); };
+  if (vis) vis.onchange = () => { const doc = cur(); doc.visitors = Math.max(+vis.value || 0, (doc.guests || []).length); vis.value = doc.visitors; save(doc); };
   if (nw) nw.onchange = () => { const doc = cur(); doc.newcomers = +nw.value || 0; save(doc); };
   if (note) note.onchange = () => { const doc = cur(); doc.note = note.value; save(doc); };
   const q = $("#at-q"); q.oninput = () => { const v = q.value.trim(); $$(".att").forEach(el => el.style.display = !v || el.dataset.nm.includes(v) ? "" : "none"); };
@@ -1842,6 +1883,71 @@ Object.assign(MemberUI, {
   },
 });
 
+/* ========== 절기 헌금: 주일(날짜)마다 절기를 지정하고, 절기별로 합계를 본다 ==========
+   offerings/<날짜>.season = "추수감사" 처럼 문서에 절기 이름을 함께 저장한다. 자동 추천은 SEASON_FROM 이후 날짜부터(배포판은 제한 없음). */
+const SEASON_FROM = "2000-01-01";
+const SEASONS = ["새해감사", "부활절", "맥추감사", "창립감사", "추수감사", "송구영신", "성탄"];
+const easterOf = y => { const a = y % 19, b = Math.floor(y / 100), c = y % 100, d = Math.floor(b / 4), e = b % 4, f = Math.floor((b + 8) / 25), g = Math.floor((b - f + 1) / 3), h = (19 * a + b - d - g + 15) % 30, i = Math.floor(c / 4), k = c % 4, l = (32 + 2 * e + 2 * i - h - k) % 7, m = Math.floor((a + 11 * h + 22 * l) / 451), mo = Math.floor((h + l - 7 * m + 114) / 31), da = ((h + l - 7 * m + 114) % 31) + 1; return `${y}-${pad(mo)}-${pad(da)}`; };
+const nthSun = (y, m, n) => { const off = (7 - new Date(y, m - 1, 1).getDay()) % 7; return ymd(new Date(y, m - 1, 1 + off + 7 * (n - 1))); };
+const seasonSuggest = d => {
+  const y = +d.slice(0, 4), out = [];
+  if (d === `${y}-12-31`) out.push("송구영신");
+  if (d === `${y}-12-25`) out.push("성탄");
+  if (d === `${y}-01-01` || d === nthSun(y, 1, 1)) out.push("새해감사");
+  if (d === easterOf(y)) out.push("부활절");
+  if (d === nthSun(y, 6, 3)) out.push("창립감사");
+  if (d === nthSun(y, 7, 1)) out.push("맥추감사");
+  if (d === nthSun(y, 11, 3)) out.push("추수감사");
+  return out;
+};
+const seasonCur = (doc, d) => (OF.sp && OF.sp.d === d) ? OF.sp.v : (doc.season || "");
+const seasonSel = (doc, d) => {
+  const cur = seasonCur(doc, d), list = [...SEASONS, ...(cur && !SEASONS.includes(cur) ? [cur] : [])];
+  return `<select class="inp" id="of-season" style="width:auto" title="이 주일의 절기" onchange="SeasonUI.set(this.value)"><option value="">절기 없음</option>${list.map(s => `<option value="${esc(s)}" ${s === cur ? "selected" : ""}>${esc(s)}</option>`).join("")}<option value="__custom">직접 입력…</option></select>`;
+};
+const seasonBanner = (doc, d) => {
+  if (d < SEASON_FROM || seasonCur(doc, d)) return "";
+  const s = seasonSuggest(d); if (!s.length) return "";
+  return `<div class="banner" style="background:#fff8e1;color:#7a5200;border-color:#ffe08a">🎉 이 날은 <b>${s.join(" · ")}</b> 주일로 보입니다. ${s.map(x => `<button class="btn sm pri" onclick="SeasonUI.set('${x}')">${x} 지정</button>`).join(" ")} <span class="hint">다르면 위의 ‘절기’ 칸에서 고르세요.</span></div>`;
+};
+const SeasonUI = {
+  set(v) {
+    if (Lock.closed(OF.date)) { Lock.warn(OF.date); App.render(); return; }
+    if (v !== "__custom") return this.apply(v);
+    const ov = Sheet.open({ title: "절기 이름 직접 입력", body: `<div class="field"><label>절기 이름</label><input class="inp" id="ss-in" maxlength="20" placeholder="예: 선교주일, 신년감사"></div><div class="hint">같은 이름으로 적으면 ‘절기별 헌금’ 통계에서 한데 모입니다.</div>`, foot: `<button class="btn" id="ss-no">취소</button><button class="btn pri" id="ss-ok">저장</button>` });
+    $("#ss-no", ov).onclick = () => { Sheet.close(); App.render(); };
+    $("#ss-ok", ov).onclick = () => { const t = $("#ss-in", ov).value.trim(); if (!t) { toast("절기 이름을 입력해 주세요"); return; } Sheet.close(); this.apply(t); };
+    setTimeout(() => { const i = $("#ss-in"); i && i.focus(); }, 60);
+  },
+  apply(v) {
+    const doc = ofDoc(); if (v) doc.season = v; else delete doc.season;
+    OF.sp = { d: OF.date, v }; ofSave(); App.render();
+    toast(v ? `${fmtMD(OF.date)} 주일을 ‘${v}’로 지정했습니다${doc.entries.length ? "" : " (헌금을 입력하면 함께 저장됩니다)"}` : "절기 지정을 풀었습니다");
+  },
+};
+function seasonAgg(year) {
+  const by = {};
+  for (const [date, doc] of Object.entries(S.offerings)) {
+    if (!date.startsWith(year + "-") || !doc.season) continue;
+    const o = by[doc.season] = by[doc.season] || { dates: [], se: 0, total: 0, donors: new Set() };
+    o.dates.push(date);
+    for (const e of doc.entries || []) { const t = rowTotal(e); o.total += t; o.se += +(e.a || {})["절기헌금"] || 0; if (t) o.donors.add(e.mid || "n:" + e.name); }
+  }
+  for (const o of Object.values(by)) o.dates.sort();
+  return by;
+}
+function seasonModel(year) {
+  const cur = seasonAgg(year), prev = seasonAgg(year - 1), names = Object.keys(cur).sort((a, b) => cur[a].dates[0] < cur[b].dates[0] ? -1 : 1);
+  const sum = (o, k) => Object.values(o).reduce((s, x) => s + x[k], 0);
+  const s1 = { h: `${year}년 절기별 헌금`, note: `절기헌금 = ‘절기헌금’ 종류의 금액, 그날 전체 헌금 = 그날 모든 종류의 합계입니다. 절기를 지정한 주일만 집계됩니다.`, numFrom: 2, head: ["절기", "날짜", "절기헌금", "그날 전체 헌금", "헌금자 수"],
+    rows: names.length ? names.map(n => ({ cells: [n, cur[n].dates.map(fmtMD).join(", "), cur[n].se, cur[n].total, cur[n].donors.size] })) : [{ cells: ["(절기를 지정한 주일이 없습니다)", "", "", "", ""] }] };
+  if (names.length) s1.rows.push({ cls: "sum", cells: ["합계", "", sum(cur, "se"), sum(cur, "total"), ""] });
+  const all = [...new Set([...names, ...Object.keys(prev)])];
+  const s2 = { h: `전년 대비 (절기헌금)`, head: ["절기", `${year - 1}년`, `${year}년`, "증감"], rows: all.map(n => ({ cells: [n, prev[n] ? prev[n].se : 0, cur[n] ? cur[n].se : 0, (cur[n] ? cur[n].se : 0) - (prev[n] ? prev[n].se : 0)] })) };
+  if (all.length) s2.rows.push({ cls: "sum", cells: ["합계", sum(prev, "se"), sum(cur, "se"), sum(cur, "se") - sum(prev, "se")] });
+  return { title: `${year}년 절기별 헌금`, sub: `절기를 지정한 주일 ${names.reduce((n, k) => n + cur[k].dates.length, 0)}회`, sections: all.length ? [s1, s2] : [s1] };
+}
+
 /* ========== 헌금 입력 ========== */
 const OF = { date: null, type: null, pay: "c", draft: null, draftDate: null, dirty: false, saveT: null, failed: false, retries: 0, retryT: null, baseU: "", baseMap: {} };
 /* 편집을 시작한 시점의 문서(updated 시각과 항목별 내용)를 기억해 두었다가, 저장할 때 다른 기기에서 먼저 바뀐 부분과 합친다 */
@@ -1871,6 +1977,7 @@ function ofSave(now) {
   OF.dirty = true; clearTimeout(OF.saveT); clearTimeout(OF.retryT); ofState("saving");
   const run = async () => {
     const doc = OF.draft, date = OF.draftDate; doc.entries = doc.entries.filter(e => e.mid || e.name || rowTotal(e));
+    if (OF.sp && OF.sp.d === date && doc.entries.length) { if (OF.sp.v) doc.season = OF.sp.v; else delete doc.season; }
     if (Lock.check("offerings", date, doc)) { Lock.warn(date); OF.draft = null; OF.dirty = false; OF.failed = false; ofBase(S.offerings[date]); App.render(); return; }
     /* 다른 기기에서 이 날짜가 먼저 바뀌었으면 덮어쓰지 말고 합친다 */
     const live = S.offerings[date]; let merged = 0;
@@ -1910,7 +2017,7 @@ Views.offer = () => {
     `<span class="hint" id="of-state"${OF.failed ? ` style="color:var(--red);cursor:pointer;font-weight:700" onclick="OF.retries=0;ofSave(true)"` : ""}>${OF.failed ? "⚠ 저장 실패 — 눌러서 다시 시도" : OF.dirty ? "저장 중…" : "자동 저장"}</span><button class="btn" onclick="OfferUI.importDlg()">엑셀 가져오기</button><button class="btn" onclick="OfferUI.countSheet()">계수 보고서</button>`) + banner() + Lock.note(d) +
     `<div class="toolbar"><button class="icon-btn" onclick="OfferUI.move(-7)">‹</button>
       <input type="date" class="inp" style="width:auto" value="${d}" onchange="OfferUI.setDate(this.value)">
-      <button class="icon-btn" onclick="OfferUI.move(7)">›</button><button class="btn sm" onclick="OfferUI.setDate(lastSunday())">이번 주일</button></div>
+      <button class="icon-btn" onclick="OfferUI.move(7)">›</button><button class="btn sm" onclick="OfferUI.setDate(lastSunday())">이번 주일</button>${seasonSel(doc, d)}</div>${seasonBanner(doc, d)}
     <div class="card" style="margin-bottom:16px"><h3>빠른 입력 <small>헌금봉투 한 장씩 · 금액은 “5만”, “3.5만”처럼 써도 됩니다</small></h3>
       <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;position:relative">
         <div style="flex:2;min-width:160px;position:relative"><input class="inp" id="qa-name" placeholder="헌금자 이름" autocomplete="off"></div>
@@ -1939,7 +2046,7 @@ Views.offer = () => {
 };
 Views._after_offer = () => {
   const g = $("#of-grid"); if (g && innerWidth < 1000) g.style.gridTemplateColumns = "1fr";
-  if (Lock.closed(OF.date)) { $$("#qa-name,#qa-type,#qa-amt,#qa-memo,#qa-add,.oe input,[data-del],[data-pay]").forEach(e => { e.disabled = true; }); $$("button").forEach(b => { if (/빈 줄 추가/.test(b.textContent)) b.disabled = true; }); }
+  if (Lock.closed(OF.date)) { $$("#qa-name,#qa-type,#qa-amt,#qa-memo,#qa-add,#of-season,.oe input,[data-del],[data-pay]").forEach(e => { e.disabled = true; }); $$("button").forEach(b => { if (/빈 줄 추가/.test(b.textContent)) b.disabled = true; }); }
   const nm = $("#qa-name"), ty = $("#qa-type"), am = $("#qa-amt"), mo = $("#qa-memo");
   Autocomplete(nm, q => members().filter(m => DN(m).includes(q)).sort((a, b) => DN(a).localeCompare(DN(b), "ko")).slice(0, 8).map(m => ({ v: DN(m), id: m.id, s: [m.pos, m.kind === "외부" ? "외부" : m.group, m.archived ? "보관" : ""].filter(Boolean).join(" · ") })), it => { nm.dataset.mid = it.id; am.focus(); });
   nm.oninput = () => { delete nm.dataset.mid; };
@@ -2491,7 +2598,7 @@ function typeMonthModel(fy) {
 
 Views.reports = () => {
   const cur = FY.cur(); RP.fy = RP.fy || cur; RP.q = RP.q || FY.qOf(today()); RP.dyear = RP.dyear || new Date().getFullYear();
-  const tabs = [["quarter", "분기 보고서"], ["annual", "연간 결산"], ["detail", "지출 상세"], ["donor", "성도별 헌금"], ["att", "성도별 출석"], ["types", "헌금 통계"], ["yearly", "연도별 비교"], ["funds", "별도 통장"]];
+  const tabs = [["quarter", "분기 보고서"], ["annual", "연간 결산"], ["detail", "지출 상세"], ["donor", "성도별 헌금"], ["att", "성도별 출석"], ["types", "헌금 통계"], ["season", "절기별 헌금"], ["yearly", "연도별 비교"], ["funds", "별도 통장"]];
   const fyOpts = []; for (let y = cur + 1; y >= FY.first(); y--) fyOpts.push([y, `${y} 회계연도 (${FY.label(y)})`]);
   let ctrl = "", model = null, extra = "";
   if (["quarter", "annual", "detail", "types"].includes(RP.tab)) ctrl += `<select class="inp" style="width:auto" onchange="RP.fy=+this.value;App.render()">${opt(fyOpts, RP.fy)}</select>`;
@@ -2500,6 +2607,7 @@ Views.reports = () => {
   if (RP.tab === "detail") model = detailModel(RP.fy);
   if (RP.tab === "types") model = typeMonthModel(RP.fy);
   if (RP.tab === "yearly") model = yearlyModel();
+  if (RP.tab === "season") { RP.syear = RP.syear || new Date().getFullYear(); ctrl += `<select class="inp" style="width:auto" onchange="RP.syear=+this.value;App.render()">${opt(Array.from({ length: 8 }, (_, i) => new Date().getFullYear() + 1 - i), RP.syear)}</select>`; model = seasonModel(RP.syear); }
   if (RP.tab === "donor") {
     ctrl += `<select class="inp" style="width:auto" onchange="RP.dyear=+this.value;App.render()">${opt(Array.from({ length: 14 }, (_, i) => new Date().getFullYear() + 1 - i), RP.dyear)}</select><div class="seg"><button class="${RP.dmode === "cal" ? "on" : ""}" onclick="RP.dmode='cal';App.render()">1~12월</button><button class="${RP.dmode === "fy" ? "on" : ""}" onclick="RP.dmode='fy';App.render()">회계연도</button></div>`;
     model = donorModel(RP.dyear, RP.dmode);
@@ -2525,7 +2633,7 @@ function donorDetail(mid, year, mode) {
     ${rows.length ? `<div class="tbl-wrap" style="max-height:340px"><table class="tbl"><thead><tr><th>날짜</th>${types.map(t => `<th class="n">${esc(TL(t))}</th>`).join("")}<th class="n">합계</th><th>메모</th></tr></thead><tbody>${rows.map(r => `<tr><td>${fmtD(r.date)}</td>${types.map(t => `<td class="n">${(r.a || {})[t] ? won(r.a[t]) : ""}</td>`).join("")}<td class="n">${won(rowTotal(r))}</td><td class="muted">${esc(r.memo || "")}</td></tr>`).join("")}</tbody></table></div>` : `<div class="hint">이 기간의 헌금 기록이 없습니다.</div>`}</div>`;
 }
 function currentModel() {
-  return { quarter: () => quarterModel(RP.fy, RP.q), annual: () => annualModel(RP.fy), detail: () => detailModel(RP.fy), types: () => typeMonthModel(RP.fy), yearly: yearlyModel, donor: () => donorModel(RP.dyear, RP.dmode) }[RP.tab]();
+  return { quarter: () => quarterModel(RP.fy, RP.q), annual: () => annualModel(RP.fy), detail: () => detailModel(RP.fy), types: () => typeMonthModel(RP.fy), season: () => seasonModel(RP.syear || new Date().getFullYear()), yearly: yearlyModel, donor: () => donorModel(RP.dyear, RP.dmode) }[RP.tab]();
 }
 /* ===== 보고서 인쇄 양식: 표지 머리글 · 번호 소제목 · 가로선 위주 표 · 합계/대분류 강조 · 쪽마다 표 제목 반복 ===== */
 const RPV = { land: null, appr: false, seal: "none" };
@@ -2808,7 +2916,7 @@ const Exp = {
     return { id, url: `https://docs.google.com/spreadsheets/d/${id}/edit`, title, formatted };
   },
 };
-const RPV_FIT = ["quarter", "annual", "yearly", "types"];
+const RPV_FIT = ["quarter", "annual", "yearly", "types", "season"];
 /* ===== 부서 보고서: R = { name, church, cur, years: { fy: { items:[{id,name,cat,subs,budget,next,subBud}], rows:[{date,itemId,sub,desc,payee,method,evid,by,amount}], hasNext } } } ===== */
 const DREP_KINDS = [["quarter", "분기 보고서"], ["annual", "연간 결산"], ["detail", "지출 상세"], ["att", "출석 통계"]];
 function deptRows(Y, a, b, f) { return (Y.rows || []).filter(r => r.date >= a && r.date <= b && (!f || f(r))); }
