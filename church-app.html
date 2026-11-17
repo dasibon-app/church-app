@@ -364,7 +364,7 @@ const FY = {
 const ymKey = (y, m) => `${y}-${pad(m)}`;
 
 /* ========== 기본 설정 ========== */
-const APP_VERSION = "1.3.0", APP_DATE = "2026-11-15", APP_EDITION = "구독자 배포판";
+const APP_VERSION = "1.4.0", APP_DATE = "2026-11-17", APP_EDITION = "구독자 배포판";
 const MAKER = { church: "다시본교회", pastor: "주진규 목사", home: "https://dasibon.icg21.com/", bulletin: "https://dasibon-church.jinkyuju.workers.dev/", youtube: "https://www.youtube.com/@dasibon", releases: "https://github.com/dasibon-app/church-app/releases/latest" };
 const makerHtml = () => `<b>${MAKER.church}</b> ${MAKER.pastor}가 작은 교회를 위해 만들어 무료로 나눕니다.<br>
   <a href="${MAKER.home}" target="_blank" rel="noopener noreferrer">교회 홈페이지</a> · <a href="${MAKER.bulletin}" target="_blank" rel="noopener noreferrer">웹주보</a> · <a href="${MAKER.youtube}" target="_blank" rel="noopener noreferrer">유튜브</a>`;
@@ -1948,6 +1948,239 @@ function seasonModel(year) {
   return { title: `${year}년 절기별 헌금`, sub: `절기를 지정한 주일 ${names.reduce((n, k) => n + cur[k].dates.length, 0)}회`, sections: all.length ? [s1, s2] : [s1] };
 }
 
+/* ========== 예산안 (다음 회계연도 예산을 미리 짜 보고 · 2개 안 비교 · 심의용 PDF · 확정) ========== */
+/* 안은 settings.budgetDrafts[회계연도][A|B] 에 따로 보관합니다. ‘이 안으로 확정’ 전까지 실제 예산(settings.budgets)·집행률·부서 화면은 바뀌지 않습니다. */
+const BP = {
+  fy: null, pid: "A", view: "edit", proj: "scale", cache: {}, key: null, dirty: false, saveT: null, prev: null, IDS: ["A", "B"],
+  fyList() { const c = FY.cur(); return [c + 1, c]; },
+  /* load(): 화면을 그리는 동안 같은 사본을 계속 쓴다. sync(): 그리기 시작할 때 한 번만, 고치는 중이 아니면 설정에서 최신 내용을 다시 읽는다 */
+  load() { if (this.fy == null) this.fy = FY.cur() + 1; if (this.key !== this.fy) this.sync(true); return this.cache; },
+  sync(force) { if (this.fy == null) this.fy = FY.cur() + 1; if (force || !this.dirty) { this.cache = structuredClone(((ST().budgetDrafts || {})[this.fy]) || {}); for (const k of Object.keys(this.cache)) { const p = this.cache[k], m = p && /^안 ([AB])$/.exec(p.name || ""); if (m) p.name = m[1] + "안"; } this.key = this.fy; this.dirty = false; } },
+  plan(pid) { return this.load()[pid || this.pid]; },
+  touch(pl) { this.dirty = true; if (pl && pl.confirmedAt) pl.editedAfter = true; pl && (pl.edited = new Date().toISOString()); clearTimeout(this.saveT); this.saveT = setTimeout(() => this.flush(), 900); },
+  async flush() {
+    if (!this.dirty) return true; clearTimeout(this.saveT);
+    const fy = this.key, data = structuredClone(this.cache); this.dirty = false;
+    return this.write(fy, data);
+  },
+  async write(fy, data, extra) {
+    const base = structuredClone(ST()), d = structuredClone(ST());
+    d.budgetDrafts = d.budgetDrafts || {};
+    if (Object.keys(data).length) d.budgetDrafts[fy] = data; else delete d.budgetDrafts[fy];
+    if (extra) extra(d);
+    try { await Store.saveSettings(d, base); return true; } catch (e) { toast("예산안을 저장하지 못했습니다. 연결을 확인해 주세요"); this.dirty = true; return false; }
+  },
+  /* ---- 계산 ---- */
+  ctx() {
+    const fy = this.fy, by = fy - 1, [a, b] = FY.range(by), inc = incomeBy(a, b), ex = expenseBy(a, b), bud = budgetOf(by), sepT = new Set(ST().funds.flatMap(f => f.inTypes || []));
+    const t = today(); let f = 1;
+    if (t <= b) { if (t < a) f = 0; else { const A = parseD(a).getTime(), B = parseD(b).getTime(), T = parseD(t).getTime(); f = (T - A + 864e5) / (B - A + 864e5); } }
+    const sc = this.proj === "scale" && f > 0.15 && f < 1 ? 1 / f : 1, P = x => Math.round((+x || 0) * sc);
+    const types = {}, items = {}, subs = {}; let ia = 0, sa = 0, ea = 0;
+    for (const ty of ST().types) { types[ty.name] = P(inc.types[ty.name]); ia += types[ty.name]; if (sepT.has(ty.name)) sa += types[ty.name]; }
+    for (const c0 of ST().cats) for (const it of c0.items) {
+      items[it.id] = P(ex.items[it.id]); if (!it.sep) ea += items[it.id];
+      const rs = ex.rows.filter(r => r.itemId === it.id);
+      for (const n of it.subs || []) subs[it.id + "|" + n] = P(rs.filter(r => subOf(r) === n).reduce((s, r) => s + (+r.amount || 0), 0));
+    }
+    const carry = carryOf(by);
+    return { fy, by, a, b, inc, ex, bud, sepT, f, sc, types, items, subs, ia, sa, ea, carry, endEst: carry + ia - sa - ea };
+  },
+  /* 표 데이터: 줄마다 {k,label,cur(올해 예산),act(올해 실적·예상),val(내년 안),memo} */
+  tbl(pl, c) {
+    const v = (o, k) => +(o && o[k]) || 0, T = { inc: [], cats: [] };
+    const gs = []; for (const g of ["일반", "특별"]) { const ts = ST().types.filter(t => (t.group || "특별") === g); if (ts.length) gs.push({ g, lines: ts.map(t => ({ k: "i:" + t.name, label: TL(t.name) + (c.sepT.has(t.name) ? " [별도통장]" : ""), cur: v(c.bud.income, t.name), act: c.types[t.name] || 0, val: v(pl.income, t.name), sep: c.sepT.has(t.name) })) }); }
+    T.inc = gs;
+    const sum = (arr, f) => arr.reduce((s, x) => s + f(x), 0), ln = arr => arr.flatMap(g => g.lines);
+    T.ic = sum(ln(gs), x => x.cur); T.ia = sum(ln(gs), x => x.act); T.iv = sum(ln(gs), x => x.val);
+    T.sepC = sum(ln(gs).filter(x => x.sep), x => x.cur); T.sepA = sum(ln(gs).filter(x => x.sep), x => x.act); T.sepV = sum(ln(gs).filter(x => x.sep), x => x.val);
+    T.cats = ST().cats.map((c0, ci) => {
+      const items = c0.items.map(it => {
+        const subs = (it.subs || []).map(n => ({ k: "s:" + it.id + "|" + n, label: n, cur: v(((c.bud.sub || {})[it.id]) || {}, n), act: c.subs[it.id + "|" + n] || 0, val: v(((pl.sub || {})[it.id]) || {}, n) }));
+        const ss = sum(subs, s => s.val);
+        return { k: "e:" + it.id, id: it.id, label: it.name + (it.sep ? " [별도통장]" : ""), sep: !!it.sep, cur: v(c.bud.expense, it.id), act: c.items[it.id] || 0, val: ss > 0 ? ss : v(pl.expense, it.id), derived: ss > 0, subs };
+      });
+      const main = items.filter(i => !i.sep);
+      return { name: c0.name, ci, items, cur: sum(main, i => i.cur), act: sum(main, i => i.act), val: sum(main, i => i.val) };
+    });
+    T.ec = sum(T.cats, x => x.cur); T.ea = sum(T.cats, x => x.act); T.ev = sum(T.cats, x => x.val);
+    T.carry = { k: "i:__carry", label: "이월금(전기이월·통장잔액)", cur: v(c.bud.income, "__carry"), act: c.endEst, val: v(pl.income, "__carry") };
+    T.netC = T.ic - T.sepC - T.ec; T.netA = T.ia - T.sepA - T.ea; T.netV = T.iv - T.sepV - T.ev;
+    T.endC = T.carry.cur + T.netC; T.endA = c.endEst; T.endV = T.carry.val + T.netV;
+    T.cin = { cur: T.carry.cur, act: c.carry, val: T.carry.val };
+    return T;
+  },
+  sgn: n => (n > 0 ? "+" : "") + won(n),
+  dpct(cur, val) { if (!cur) return val ? "신규" : "-"; const p = (val / cur - 1) * 100; return (p > 0 ? "+" : "") + p.toFixed(1) + "%"; },
+  /* 화면에 보이는 계산 칸의 값 (칸마다 data-dk) */
+  map(T) {
+    const M = {}, put = (k, cur, act, val) => { M[k + ".c"] = won(cur); M[k + ".a"] = won(act); M[k + ".v"] = won(val); M[k + ".d"] = this.sgn(val - cur); M[k + ".p"] = this.dpct(cur, val); };
+    for (const g of T.inc) { put("g:" + g.g, g.lines.reduce((s, x) => s + x.cur, 0), g.lines.reduce((s, x) => s + x.act, 0), g.lines.reduce((s, x) => s + x.val, 0)); for (const x of g.lines) put(x.k, x.cur, x.act, x.val); }
+    put("i:__carry", T.carry.cur, T.carry.act, T.carry.val);
+    for (const ct of T.cats) { put("c:" + ct.ci, ct.cur, ct.act, ct.val); for (const it of ct.items) { put(it.k, it.cur, it.act, it.val); for (const s of it.subs) put(s.k, s.cur, s.act, s.val); } }
+    put("T:inc", T.ic, T.ia, T.iv); put("T:exp", T.ec, T.ea, T.ev); put("T:net", T.netC, T.netA, T.netV);
+    put("T:cin", T.cin.cur, T.cin.act, T.cin.val); put("T:end", T.endC, T.endA, T.endV);
+    return M;
+  },
+  /* ---- 시작점 채우기 ---- */
+  R: x => Math.round((+x || 0) / 10000) * 10000,
+  fillBudget(pl, c) { pl.income = {}; pl.expense = {}; pl.sub = {}; for (const t of ST().types) pl.income[t.name] = +c.bud.income[t.name] || 0; for (const [k, x] of Object.entries(c.bud.expense || {})) pl.expense[k] = +x || 0; for (const [k, o] of Object.entries(c.bud.sub || {})) pl.sub[k] = { ...o }; pl.income.__carry = this.R(c.endEst); },
+  fillActual(pl, c) {
+    pl.income = {}; pl.expense = {}; pl.sub = {}; for (const t of ST().types) pl.income[t.name] = this.R(c.types[t.name]);
+    for (const c0 of ST().cats) for (const it of c0.items) {
+      if ((it.subs || []).length && it.subs.some(n => c.subs[it.id + "|" + n])) { pl.sub[it.id] = {}; let s = 0; for (const n of it.subs) { pl.sub[it.id][n] = this.R(c.subs[it.id + "|" + n]); s += pl.sub[it.id][n]; } pl.expense[it.id] = s; }
+      else pl.expense[it.id] = this.R(c.items[it.id]);
+    }
+    pl.income.__carry = this.R(c.endEst);
+  },
+  scale(pl, scope, rate) {
+    const m = 1 + rate / 100, R = x => Math.round(x * m / 1000) * 1000;
+    if (scope === "inc") { for (const t of ST().types) if (pl.income[t.name]) pl.income[t.name] = R(+pl.income[t.name]); return; }
+    for (const c0 of ST().cats) { if (scope !== "exp" && scope !== "c:" + c0.name) continue; for (const it of c0.items) { const so = (pl.sub || {})[it.id]; if (so && Object.values(so).some(x => +x)) { for (const n of Object.keys(so)) so[n] = R(+so[n] || 0); pl.expense[it.id] = Object.values(so).reduce((s, x) => s + (+x || 0), 0); } else if (pl.expense[it.id]) pl.expense[it.id] = R(+pl.expense[it.id]); } }
+  },
+  assume(pl, c, rate) { for (const t of ST().types) pl.income[t.name] = Math.round(c.types[t.name] * (1 + rate / 100) / 10000) * 10000; },
+  snap() { this.prev = { fy: this.fy, pid: this.pid, data: structuredClone(this.plan()) }; },
+  undo() { if (!this.prev || this.prev.fy !== this.fy) return; this.cache[this.prev.pid] = this.prev.data; this.prev = null; this.touch(this.cache[this.pid]); App.render(true); },
+  /* ---- 안 만들기 · 복제 · 삭제 · 확정 ---- */
+  newPlan(pid, how) {
+    const cache = this.load(), c = this.ctx(), pl = { name: pid + "안", at: new Date().toISOString(), income: {}, expense: {}, sub: {}, memo: {} };
+    if (how === "budget") this.fillBudget(pl, c); else if (how === "actual") this.fillActual(pl, c);
+    else if (how && how.startsWith("copy:") && cache[how.slice(5)]) { const s = structuredClone(cache[how.slice(5)]); Object.assign(pl, { income: s.income, expense: s.expense, sub: s.sub || {}, memo: s.memo || {} }); pl.name = pid + "안"; }
+    cache[pid] = pl; this.pid = pid; this.view = "edit"; this.touch(pl); App.render(true);
+  },
+  startSheet(pid) {
+    const others = this.IDS.filter(x => x !== pid && this.load()[x]);
+    const ov = Sheet.open({ title: `${pid}안 만들기`, body: `<div class="hint mb">어디서 시작할까요? 만든 뒤 금액은 얼마든지 고칠 수 있습니다.</div><div class="col" style="gap:8px">
+      <button class="btn" data-how="budget">올해(${this.fy - 1}년) 예산 그대로 복사</button>
+      <button class="btn" data-how="actual">올해 실적(연말 예상)에서 시작 <span class="hint">· 만원 단위로 반올림</span></button>
+      ${others.map(o => `<button class="btn" data-how="copy:${o}">${o}안 복제</button>`).join("")}
+      <button class="btn" data-how="empty">빈 안으로 시작</button></div>` });
+    $$("[data-how]", ov).forEach(b => b.onclick = () => { Sheet.close(); this.newPlan(pid, b.dataset.how); });
+  },
+  async confirmPlan() {
+    const pl = this.plan(), fy = this.fy; if (!pl) return; await this.flush();
+    const has = (budgetOf(fy).expense && Object.values(budgetOf(fy).expense).some(x => +x)) || Object.values(budgetOf(fy).income || {}).some(x => +x);
+    Sheet.confirm(`<b>${fy}년 예산을 「${esc(pl.name)}」으로 확정할까요?</b><br><span class="hint">${has ? `지금 입력되어 있는 ${fy}년 예산은 이 안으로 <b>바뀝니다</b>.` : `${fy}년 예산이 이 안으로 채워집니다.`} 실행 전에 <b>복구 지점이 자동으로 만들어지므로</b> 설정 ▸ 데이터에서 되돌릴 수 있습니다. 실적과 다른 연도는 바뀌지 않습니다.</span>`, async () => {
+      if (Store.mode === "cloud") {
+        if (!Restore.ready()) { toast("지금은 확정할 수 없습니다 (서버 연결·불러오기 확인 후 다시)"); return; }
+        try { toast("복구 지점을 만드는 중…"); await Restore.write("m" + Date.now().toString(36), `예산안 확정 직전 (${fy}년)`, Restore.pack()); } catch (e) { toast("복구 지점을 만들지 못해 확정을 중단했습니다"); return; }
+      }
+      const data = structuredClone(this.load()); data[this.pid].confirmedAt = new Date().toISOString(); delete data[this.pid].editedAfter; for (const k of this.IDS) if (k !== this.pid && data[k]) delete data[k].confirmedAt;
+      const src = structuredClone(pl);
+      const ok = await this.write(fy, data, d => {
+        d.budgets = d.budgets || {}; const b = d.budgets[fy] = { income: {}, expense: {} };
+        for (const [k, x] of Object.entries(src.income || {})) if (+x) b.income[k] = +x;
+        for (const [k, x] of Object.entries(src.expense || {})) if (+x) b.expense[k] = +x;
+        const so = {}; for (const [k, o] of Object.entries(src.sub || {})) { const q = {}; for (const [n, x] of Object.entries(o || {})) if (+x) q[n] = +x; if (Object.keys(q).length) so[k] = q; } if (Object.keys(so).length) b.sub = so;
+      });
+      if (ok) { this.cache = data; this.key = fy; toast(`${fy}년 예산을 「${src.name}」으로 확정했습니다`); App.render(true); }
+    }, "확정");
+  },
+  del() { const pl = this.plan(); if (!pl) return; Sheet.confirm(`「${esc(pl.name)}」을 삭제할까요?<br><span class="hint">이미 확정한 실제 예산은 그대로 남습니다. 이 안만 지워집니다.</span>`, () => { this.snap(); delete this.cache[this.pid]; this.dirty = true; this.flush(); this.pid = this.IDS.find(x => this.cache[x]) || "A"; App.render(true); }); },
+  /* ---- 일괄 증감 · 수입 가정 ---- */
+  bulkSheet() {
+    const pl = this.plan(), c = this.ctx(); if (!pl) return;
+    const ov = Sheet.open({ title: "일괄 증감 (%)", body: `<div class="hint mb">지금 입력된 「내년 안」 금액에 비율을 곱합니다(천원 단위 반올림). 직전 상태로 되돌릴 수 있습니다.</div>
+      <label class="fld"><span>어디에</span><select class="inp" id="bk-s"><option value="exp">지출 전체</option><option value="inc">수입 전체(이월금 제외)</option>${ST().cats.map(x => `<option value="c:${esc(x.name)}">지출 · ${esc(x.name)}만</option>`).join("")}</select></label>
+      <label class="fld"><span>증감률 (%)</span><input class="inp" id="bk-r" type="number" step="0.5" value="3"></label>
+      <div class="hint">예) 3 → 3% 늘림, -5 → 5% 줄임</div>`, foot: `<button class="btn" data-x>취소</button><button class="btn pri" id="bk-ok">적용</button>` });
+    $("#bk-ok", ov).onclick = () => { const r = parseFloat($("#bk-r", ov).value); if (!isFinite(r)) { toast("증감률을 숫자로 입력해 주세요"); return; } this.snap(); this.scale(pl, $("#bk-s", ov).value, r); this.touch(pl); Sheet.close(); App.render(true); };
+  },
+  assumeSheet() {
+    const pl = this.plan(), c = this.ctx(); if (!pl) return;
+    const ov = Sheet.open({ title: "수입 안 자동 계산", body: `<div class="hint mb">「올해 실적(연말 예상) × (1 + 가정%)」으로 헌금 종류별 수입 안을 채웁니다(만원 단위 반올림). 지출과 이월금은 그대로 둡니다.</div>
+      <label class="fld"><span>내년 수입 가정 (%)</span><input class="inp" id="as-r" type="number" step="0.5" value="0"></label><div class="hint">예) 0 → 올해와 같게, 5 → 5% 증가, -3 → 3% 감소</div>`, foot: `<button class="btn" data-x>취소</button><button class="btn pri" id="as-ok">적용</button>` });
+    $("#as-ok", ov).onclick = () => { const r = parseFloat($("#as-r", ov).value); if (!isFinite(r)) { toast("숫자로 입력해 주세요"); return; } this.snap(); this.assume(pl, c, r); this.touch(pl); Sheet.close(); App.render(true); };
+  },
+  /* ---- 보고서 모델 (심의용 PDF · 엑셀) ---- */
+  model(pid, withCmp) {
+    const pl = this.load()[pid], c = this.ctx(), T = this.tbl(pl, c), by = c.by, fy = c.fy, ch = ST().church, memo = k => (pl.memo || {})[k] || "";
+    const H = ["코드", "항목", `${by}년 예산`, `${by}년 실적`, `${fy}년 안`, "증감", "증감률", "비고"];
+    const row = (code, x, cls) => ({ cls, cells: [code, x.label, x.cur, x.act, x.val, x.val - x.cur, this.dpct(x.cur, x.val), memo(x.k)] });
+    const s1 = { h: "1. 예산안 요약", note: `증감은 ${by}년 예산 대비입니다. ${by}년 실적은 ${c.sc > 1 ? `경과 ${Math.round(c.f * 100)}%를 연말로 환산한 예상치` : (c.f < 1 ? "현재까지의 실적" : "결산 실적")}입니다.`, head: ["구분", `${by}년 예산`, `${by}년 실적`, `${fy}년 안`, "증감", "증감률"], numFrom: 1, rows: [
+      { cells: ["헌금 수입 합계", T.ic, T.ia, T.iv, T.iv - T.ic, this.dpct(T.ic, T.iv)] },
+      { cells: ["지출 합계", T.ec, T.ea, T.ev, T.ev - T.ec, this.dpct(T.ec, T.ev)] },
+      ...(T.sepC || T.sepA || T.sepV ? [{ cells: ["별도통장으로 분리되는 헌금", -T.sepC, -T.sepA, -T.sepV, -(T.sepV - T.sepC), ""] }] : []),
+      { cls: "sum", cells: ["차액 (헌금계좌 기준)", T.netC, T.netA, T.netV, T.netV - T.netC, ""] },
+      { cells: ["전기이월금", T.cin.cur, T.cin.act, T.carry.val, T.carry.val - T.cin.cur, ""] },
+      { cls: "sum", cells: ["예상 차기이월금", T.endC, T.endA, T.endV, T.endV - T.endC, ""] }] };
+    const s2 = { h: "2. 수입 예산안", head: H, numFrom: 2, rows: [] };
+    T.inc.forEach((g, gi) => { const a = g.lines.reduce((s, x) => ({ cur: s.cur + x.cur, act: s.act + x.act, val: s.val + x.val }), { cur: 0, act: 0, val: 0 }); s2.rows.push(row(`${gi + 1}`, { label: `${g.g} 헌금 합계`, k: "", ...a }, "cat")); g.lines.forEach((x, k) => { if (x.cur || x.act || x.val) s2.rows.push(row(`${gi + 1}-${k + 1}`, x)); }); });
+    s2.rows.push(row(`${T.inc.length + 1}`, T.carry)); s2.rows[s2.rows.length - 1].cells[2] = ""; s2.rows[s2.rows.length - 1].cells[3] = T.carry.act; s2.rows[s2.rows.length - 1].cells[5] = ""; s2.rows[s2.rows.length - 1].cells[6] = "";
+    s2.rows.push({ cls: "sum", cells: ["", "총 수입 금액 (이월금 포함)", T.ic + T.carry.cur, T.ia + T.carry.act, T.iv + T.carry.val, T.iv + T.carry.val - T.ic - T.carry.cur, this.dpct(T.ic + T.carry.cur, T.iv + T.carry.val), ""] });
+    const s3 = { h: "3. 지출 예산안", head: H, numFrom: 2, rows: [] };
+    T.cats.forEach(ct => { s3.rows.push(row(`${ct.ci + 1}`, { label: ct.name, k: "", cur: ct.cur, act: ct.act, val: ct.val }, "cat")); ct.items.forEach((it, ii) => { if (!(it.cur || it.act || it.val)) return; s3.rows.push(row(`${ct.ci + 1}-${ii + 1}`, it)); it.subs.forEach((s, k) => { if (s.cur || s.act || s.val) s3.rows.push(row(`${ct.ci + 1}-${ii + 1}-${k + 1}`, { ...s, label: "　└ " + s.label })); }); }); });
+    s3.rows.push({ cls: "sum", cells: ["", "총 지출 합계 (별도통장 제외)", T.ec, T.ea, T.ev, T.ev - T.ec, this.dpct(T.ec, T.ev), ""] });
+    const secs = [s1, s2, s3];
+    const oid = this.IDS.find(x => x !== pid && this.cache[x]);
+    if (withCmp && oid) {
+      const o = this.cache[oid], To = this.tbl(o, c); const [pa, pb, ta, tb] = pid < oid ? [pl, o, T, To] : [o, pl, To, T];
+      const na = pa.name, nb = pb.name;
+      const s4 = { h: `4. 안 비교 (${na} ↔ ${nb})`, head: ["코드", "항목", `${by}년 예산`, na, nb, `차이(${nb}−${na})`], numFrom: 2, rows: [] };
+      const cmp = (code, label, cur, va, vb, cls) => s4.rows.push({ cls, cells: [code, label, cur, va, vb, vb - va] });
+      ta.inc.forEach((g, gi) => g.lines.forEach((x, k) => { const vb = tb.inc[gi].lines[k].val; if (x.cur || x.val || vb) cmp(`${gi + 1}-${k + 1}`, x.label, x.cur, x.val, vb); }));
+      cmp("", "헌금 수입 합계", ta.ic, ta.iv, tb.iv, "sum");
+      ta.cats.forEach((ct, i) => { cmp(`${i + 1}`, ct.name, ct.cur, ct.val, tb.cats[i].val, "cat"); ct.items.forEach((it, ii) => { const vb = tb.cats[i].items[ii].val; if (it.cur || it.val || vb) cmp(`${i + 1}-${ii + 1}`, it.label, it.cur, it.val, vb); }); });
+      cmp("", "지출 합계", ta.ec, ta.ev, tb.ev, "sum"); cmp("", "차액 (헌금계좌 기준)", ta.netC, ta.netV, tb.netV, "sum"); cmp("", "전기이월금", ta.carry.cur, ta.carry.val, tb.carry.val); cmp("", "예상 차기이월금", ta.endC, ta.endV, tb.endV, "sum");
+      secs.push(s4);
+    }
+    secs.push({ h: `${secs.length + 1}. 심의 결과`, note: "심의 후 아래 칸에 직접 기록합니다.", head: ["구분", "내용"], numFrom: 5, rows: ["심의 일시", "채택한 안", "확정 수입 예산 총액", "확정 지출 예산 총액", "수정·조건 사항", "의결 (서명)"].map(x => ({ cells: [x, ""] })) });
+    return { title: `${fy}년도 예산안 (${pl.name})`, sub: `회계연도 ${fmtD(FY.range(fy)[0])} ~ ${fmtD(FY.range(fy)[1])} · ${ch.name}`, sections: secs };
+  },
+  async pdf(kind) { await this.flush(); const pl = this.plan(); if (!pl) return; const m = this.model(this.pid, true); RPexport(kind === "xlsx" ? "xlsx" : "print", m); },
+  /* ---- 화면 ---- */
+  bar() { this.sync(); const pl = this.plan(); return pl ? `<button class="btn" onclick="BP.pdf('xlsx')">엑셀 받기</button><button class="btn pri" onclick="BP.pdf('print')">심의용 PDF</button>` : ""; },
+  tile(l, k, sub) { return `<div class="stat"><div class="l">${l}</div><div class="v" data-dk="${k}.v">-</div><div class="s">${sub}</div></div>`; },
+  viewHTML(tabs) {
+    const cache = this.load(); if (!cache[this.pid] && this.view === "edit") this.pid = this.IDS.find(x => cache[x]) || "A";
+    const c = this.ctx(), fyOpts = this.fyList().map(y => [y, `${y} 회계연도 (${FY.label(y)}) 예산안`]);
+    const have = this.IDS.filter(x => cache[x]);
+    let h = `<div class="toolbar"><select class="inp" style="width:auto" onchange="BP.setFy(+this.value)">${opt(fyOpts, this.fy)}</select>
+      <div class="seg">${this.IDS.map(x => cache[x] ? `<button class="${this.view === "edit" && this.pid === x ? "on" : ""}" onclick="BP.go('${x}')">${esc(cache[x].name)}${cache[x].confirmedAt ? " ✔" : ""}</button>` : (x === "A" || cache.A) ? `<button onclick="BP.startSheet('${x}')">＋ ${x}안 만들기</button>` : "").join("")}${have.length > 1 ? `<button class="${this.view === "cmp" ? "on" : ""}" onclick="BP.go('cmp')">A·B 비교</button>` : ""}</div>
+      <select class="inp" style="width:auto" onchange="BP.proj=this.value;App.render(true)">${opt([["scale", "올해 실적: 연말 환산"], ["asis", "올해 실적: 지금까지 그대로"]], this.proj)}</select></div>`;
+    if (!have.length) return h + `<div class="card"><h3>${this.fy}년 예산안 만들기</h3><div class="hint mb">다음 해 예산을 미리 짜 보고, 최대 2개 안(A안·B안)을 비교한 뒤, 기존 보고서 양식 PDF로 출력해 예산 심의에 쓸 수 있습니다. 여기서 만든 안은 <b>‘이 안으로 확정’을 누르기 전까지 실제 예산·집행률·부서 화면에 영향을 주지 않습니다.</b></div><button class="btn pri" onclick="BP.startSheet('A')">안 A 만들기</button></div>`;
+    const base = `<div class="hint mb">${c.by}년 회계연도(${fmtD(c.a)}~${fmtD(c.b)}) 실적 기준${c.sc > 1 ? ` · 경과 ${Math.round(c.f * 100)}% → 연말 환산 ×${c.sc.toFixed(2)} (예상치)` : (c.f < 1 ? " · 지금까지 실적 그대로" : " · 결산 완료")}</div>`;
+    if (this.view === "cmp" && have.length > 1) { const m = this.model(this.IDS.find(x => cache[x]), true), s = m.sections.find(x => /안 비교/.test(x.h || "")); return h + base + `<div class="card"><h3 style="font-size:20px">${esc(s.h.replace(/^\d+\.\s*/, ""))}</h3>${modelHTML({ sections: [{ ...s, h: "" }] }, false)}<div class="hint" style="margin-top:8px">숫자를 고치려면 위의 안 탭에서 수정하세요. 심의용 PDF에는 이 비교표가 함께 들어갑니다.</div></div>`; }
+    const pl = cache[this.pid], T = this.tbl(pl, c), M = this.map(T), D = k => M[k] ?? "";
+    const inp = (key, val, ro) => ro ? `<span data-dk="${key}.v">${D(key + ".v")}</span>` : `<input class="inp" data-bp="${esc(key)}" inputmode="numeric" value="${val ? won(val) : ""}" style="width:112px;text-align:right">`;
+    const memo = key => `<input class="inp" data-bm="${esc(key)}" value="${esc((pl.memo || {})[key] || "")}" placeholder="심의 설명" style="min-width:150px;width:100%">`;
+    const dcell = key => `<td class="n" data-dk="${key}.d">${D(key + ".d")}</td><td class="n" data-dk="${key}.p">${D(key + ".p")}</td>`;
+    const hd = (a) => `<thead><tr><th>항목</th><th class="n">${c.by}년 예산</th><th class="n">${c.by}년 실적${c.sc > 1 ? "(예상)" : ""}</th><th class="n">${c.fy}년 안</th><th class="n">증감</th><th class="n">증감률</th><th>비고(심의 설명)</th></tr></thead>`;
+    const tr = (cls, label, key, cur, act, valHTML, memoKey) => `<tr class="${cls}"><td>${label}</td><td class="n" data-dk="${key}.c">${won(cur)}</td><td class="n" data-dk="${key}.a">${won(act)}</td><td class="n">${valHTML}</td>${dcell(key)}<td>${memoKey ? memo(memoKey) : ""}</td></tr>`;
+    let ti = "", te = "";
+    T.inc.forEach(g => { ti += tr("cat", `${g.g} 헌금 합계`, "g:" + g.g, g.lines.reduce((s, x) => s + x.cur, 0), g.lines.reduce((s, x) => s + x.act, 0), `<b data-dk="g:${g.g}.v">${D("g:" + g.g + ".v")}</b>`, ""); for (const x of g.lines) ti += tr("", esc(x.label), x.k, x.cur, x.act, inp(x.k, x.val), x.k); });
+    ti += `<tr><td>${esc(T.carry.label)}</td><td class="n">${T.carry.cur ? won(T.carry.cur) : ""}</td><td class="n" title="${c.by}년 말 예상 통장 잔액" data-dk="i:__carry.a">${won(T.carry.act)}</td><td class="n">${inp("i:__carry", T.carry.val)}</td><td class="n" data-dk="i:__carry.d">${D("i:__carry.d")}</td><td class="n" data-dk="i:__carry.p">${D("i:__carry.p")}</td><td>${memo("i:__carry")}</td></tr>`;
+    T.cats.forEach(ct => { te += tr("cat", esc(ct.name), "c:" + ct.ci, ct.cur, ct.act, `<b data-dk="c:${ct.ci}.v">${D("c:" + ct.ci + ".v")}</b>`, ""); for (const it of ct.items) { te += tr("", esc(it.label), it.k, it.cur, it.act, inp(it.k, it.val, it.derived), it.k); for (const s of it.subs) te += tr("sub", `<span class="muted">　└ ${esc(s.label)}</span>`, s.k, s.cur, s.act, inp(s.k, s.val), s.k); } });
+    const stat = (l, k, note) => `<div class="card" style="flex:1;min-width:150px;padding:10px 12px"><div class="hint">${l}</div><div style="font-size:19px;font-weight:700" data-dk="${k}.v">${D(k + ".v")}</div><div class="hint">올해 예산 대비 <span data-dk="${k}.d">${D(k + ".d")}</span></div></div>`;
+    h += base + `<div class="card mb" style="position:sticky;top:0;z-index:5"><div style="display:flex;gap:10px;flex-wrap:wrap">${stat("헌금 수입 합계", "T:inc")}${stat("지출 합계", "T:exp")}${stat("차액(수입−지출)", "T:net")}${stat("예상 차기이월금", "T:end")}</div></div>
+    <div class="card mb"><div class="toolbar" style="margin:0 0 8px"><input class="inp" id="bp-name" value="${esc(pl.name)}" style="width:150px" maxlength="20" title="안 이름">${pl.confirmedAt ? `<span class="tag">확정됨 ${fmtD(pl.confirmedAt.slice(0, 10))}${pl.editedAfter ? " · 이후 수정됨(다시 확정해야 반영)" : ""}</span>` : `<span class="tag">작성 중 · 실제 예산에 영향 없음</span>`}</div>
+      <div class="actions" style="flex-wrap:wrap;gap:6px"><button class="btn" onclick="BP.fillSheet('budget')">올해 예산 복사</button><button class="btn" onclick="BP.fillSheet('actual')">올해 실적으로 채우기</button><button class="btn" onclick="BP.assumeSheet()">수입 가정(%)</button><button class="btn" onclick="BP.bulkSheet()">일괄 증감(%)</button>${this.IDS.filter(x => x !== this.pid && !cache[x]).map(x => `<button class="btn" onclick="BP.newPlan('${x}','copy:${this.pid}')">이 안을 ${x}안으로 복제</button>`).join("")}${this.prev && this.prev.fy === this.fy ? `<button class="btn" onclick="BP.undo()">↶ 직전 상태로</button>` : ""}<button class="btn" onclick="BP.del()">안 삭제</button><button class="btn pri" onclick="BP.confirmPlan()">이 안으로 확정</button></div></div>
+    <div class="card mb"><h3>수입 예산안</h3><div class="tbl-wrap"><table class="tbl">${hd()}<tbody>${ti}<tr class="sum"><td>헌금 수입 합계</td><td class="n" data-dk="T:inc.c">${D("T:inc.c")}</td><td class="n" data-dk="T:inc.a">${D("T:inc.a")}</td><td class="n" data-dk="T:inc.v">${D("T:inc.v")}</td><td class="n" data-dk="T:inc.d">${D("T:inc.d")}</td><td class="n" data-dk="T:inc.p">${D("T:inc.p")}</td><td></td></tr></tbody></table></div></div>
+    <div class="card mb"><h3>지출 예산안</h3><div class="tbl-wrap"><table class="tbl">${hd()}<tbody>${te}<tr class="sum"><td>지출 합계 (별도통장 제외)</td><td class="n" data-dk="T:exp.c">${D("T:exp.c")}</td><td class="n" data-dk="T:exp.a">${D("T:exp.a")}</td><td class="n" data-dk="T:exp.v">${D("T:exp.v")}</td><td class="n" data-dk="T:exp.d">${D("T:exp.d")}</td><td class="n" data-dk="T:exp.p">${D("T:exp.p")}</td><td></td></tr></tbody></table></div></div>
+    <div class="hint">증감은 ${c.by}년 예산 대비입니다. ‘예상’ 열은 ${c.sc > 1 ? "지금까지 실적을 연말까지 환산한 추정치" : "실적"}라서 실제와 다를 수 있습니다. 별도통장 항목은 지출 합계에서 빠지고, 별도통장으로 가는 헌금은 차액에서 뺍니다(연간 결산과 같은 방식).</div>`;
+    return h;
+  },
+  fillSheet(how) {
+    const pl = this.plan(), c = this.ctx(); if (!pl) return;
+    Sheet.confirm(`${how === "budget" ? `올해(${c.by}년) 예산을 그대로 복사` : "올해 실적(연말 예상)으로 채우기"}를 하면 <b>지금 입력한 금액이 모두 바뀝니다.</b><br><span class="hint">‘↶ 직전 상태로’ 버튼으로 되돌릴 수 있습니다. 비고(심의 설명)는 그대로 둡니다.</span>`, () => { this.snap(); if (how === "budget") this.fillBudget(pl, c); else this.fillActual(pl, c); this.touch(pl); App.render(true); }, "적용");
+  },
+  setFy(y) { this.flush().then(() => { this.fy = y; this.view = "edit"; this.pid = "A"; this.key = null; this.prev = null; App.render(true); }); },
+  go(x) { if (x === "cmp") this.view = "cmp"; else { this.view = "edit"; this.pid = x; } App.render(true); },
+  upd() { const pl = this.plan(); if (!pl) return; const M = this.map(this.tbl(pl, this.ctx())); $$("[data-dk]").forEach(e => { const t = M[e.dataset.dk]; if (t !== undefined) e.textContent = t; }); },
+  bind() {
+    const pl = this.plan(); if (!pl) return;
+    pl.income = pl.income || {}; pl.expense = pl.expense || {}; pl.sub = pl.sub || {}; pl.memo = pl.memo || {};
+    $$("[data-bp]").forEach(i => i.onchange = () => {
+      const v = parseAmt(i.value), key = i.dataset.bp, [t, rest] = [key[0], key.slice(2)];
+      if (t === "i") pl.income[rest] = v; else if (t === "e") pl.expense[rest] = v;
+      else { const [id, n] = rest.split("|"); pl.sub[id] = pl.sub[id] || {}; pl.sub[id][n] = v; pl.expense[id] = Object.values(pl.sub[id]).reduce((s, x) => s + (+x || 0), 0); if (pl.expense[id] === 0) delete pl.expense[id]; }
+      i.value = v ? won(v) : ""; this.touch(pl); this.upd(); if (t === "s") App.render();
+    });
+    $$("[data-bm]").forEach(i => i.onchange = () => { if (i.value.trim()) pl.memo[i.dataset.bm] = i.value.trim(); else delete pl.memo[i.dataset.bm]; this.touch(pl); });
+    const nm = $("#bp-name"); if (nm) nm.onchange = () => { pl.name = nm.value.trim() || this.pid + "안"; nm.value = pl.name; this.touch(pl); App.render(); };
+  },
+};
+
 /* ========== 헌금 입력 ========== */
 const OF = { date: null, type: null, pay: "c", draft: null, draftDate: null, dirty: false, saveT: null, failed: false, retries: 0, retryT: null, baseU: "", baseMap: {} };
 /* 편집을 시작한 시점의 문서(updated 시각과 항목별 내용)를 기억해 두었다가, 저장할 때 다른 기기에서 먼저 바뀐 부분과 합친다 */
@@ -2598,7 +2831,7 @@ function typeMonthModel(fy) {
 
 Views.reports = () => {
   const cur = FY.cur(); RP.fy = RP.fy || cur; RP.q = RP.q || FY.qOf(today()); RP.dyear = RP.dyear || new Date().getFullYear();
-  const tabs = [["quarter", "분기 보고서"], ["annual", "연간 결산"], ["detail", "지출 상세"], ["donor", "성도별 헌금"], ["att", "성도별 출석"], ["types", "헌금 통계"], ["season", "절기별 헌금"], ["yearly", "연도별 비교"], ["funds", "별도 통장"]];
+  const tabs = [["quarter", "분기 보고서"], ["annual", "연간 결산"], ["plan", "예산안"], ["detail", "지출 상세"], ["donor", "성도별 헌금"], ["att", "성도별 출석"], ["types", "헌금 통계"], ["season", "절기별 헌금"], ["yearly", "연도별 비교"], ["funds", "별도 통장"]];
   const fyOpts = []; for (let y = cur + 1; y >= FY.first(); y--) fyOpts.push([y, `${y} 회계연도 (${FY.label(y)})`]);
   let ctrl = "", model = null, extra = "";
   if (["quarter", "annual", "detail", "types"].includes(RP.tab)) ctrl += `<select class="inp" style="width:auto" onchange="RP.fy=+this.value;App.render()">${opt(fyOpts, RP.fy)}</select>`;
@@ -2613,6 +2846,7 @@ Views.reports = () => {
     model = donorModel(RP.dyear, RP.dmode);
     if (RP.donor) extra = donorDetail(RP.donor, RP.dyear, RP.dmode);
   }
+  if (RP.tab === "plan") return topBar("보고서·통계", "", BP.bar()) + `<div class="seg mb" style="max-width:100%;overflow:auto">${tabs.map(([k, l]) => `<button class="${RP.tab === k ? "on" : ""}" onclick="RP.tab='${k}';App.render()">${l}</button>`).join("")}</div>` + BP.viewHTML();
   if (RP.tab === "att") return topBar("보고서·통계", "", `<button class="btn" onclick="AttRP.xlsx()">엑셀 받기</button>`) + `<div class="seg mb" style="max-width:100%;overflow:auto">${tabs.map(([k, l]) => `<button class="${RP.tab === k ? "on" : ""}" onclick="RP.tab='${k}';App.render()">${l}</button>`).join("")}</div>` + AttRP.view(fyOpts);
   if (RP.tab === "funds") return topBar("보고서·통계", "", "") + `<div class="seg mb">${tabs.map(([k, l]) => `<button class="${RP.tab === k ? "on" : ""}" onclick="RP.tab='${k}';App.render()">${l}</button>`).join("")}</div>` + fundsView();
   return topBar("보고서·통계", model.sub, `<button class="btn" onclick="RPexport('xlsx')">엑셀 받기</button><button class="btn pri" onclick="RPexport('print')">인쇄용 보기</button>`) +
@@ -2621,6 +2855,7 @@ Views.reports = () => {
     <div class="card"><h3 style="font-size:20px">${esc(model.title)}</h3>${modelHTML(model, false)}</div>`;
 };
 Views._after_reports = () => {
+  if (RP.tab === "plan") BP.bind();
   if (RP.tab === "donor") $$(".card .tbl tbody tr").forEach((tr, i) => { const m = donorModel(RP.dyear, RP.dmode).sections[0].rows[i]; if (m && m.k && !m.k.startsWith("name:")) { tr.style.cursor = "pointer"; tr.onclick = () => { RP.donor = m.k; App.render(); }; } });
 };
 function donorDetail(mid, year, mode) {
@@ -2648,10 +2883,10 @@ function reportDoc(m, o = {}) {
     const num = i >= (s.numFrom ?? 1) && !rpTextCols(s).has(i);
     if (typeof c === "number") return `<td class="${num ? "" : "l"}${c < 0 ? " neg" : ""}${c === 0 ? " zero" : ""}">${c === 0 ? "–" : won(c)}</td>`;
     const str = String(c ?? "");
-    if (!num) { const ind = (/^[ 　]+/.exec(str) || [""])[0].length; return `<td class="l"${ind ? ` style="padding-left:${(0.7 + ind * 0.55).toFixed(2)}em"` : ""}>${esc(str.replace(/^[ 　]+/, ""))}</td>`; }
+    if (!num) { const ind = (/^[ 　]+/.exec(str) || [""])[0].length; return `<td class="l"${ind ? ` style="padding-left:${(0.7 + ind * 0.55).toFixed(2)}em"` : (i === 0 && s.head && s.head[0] === "코드" ? ` style="white-space:nowrap"` : "")}>${esc(str.replace(/^[ 　]+/, ""))}</td>`; }
     return `<td>${esc(str)}</td>`;
   };
-  const secs = m.sections.map(s => `<section>${s.h ? `<h2>${esc(s.h)}</h2>` : ""}${s.note ? `<div class="note">${s.note}</div>` : ""}${s.head ? `<table><thead><tr>${s.head.map((h, i) => `<th class="${i >= (s.numFrom ?? 1) && !rpTextCols(s).has(i) ? "" : "l"}">${esc(h)}</th>`).join("")}</tr></thead><tbody>${s.rows.map(r => `<tr class="${r.cls || ""}">${r.cells.map((c, i) => cell(c, i, s)).join("")}</tr>`).join("")}</tbody></table>` : ""}</section>`).join("");
+  const secs = m.sections.map(s => `<section>${s.h ? `<h2>${esc(s.h)}</h2>` : ""}${s.note ? `<div class="note">${s.note}</div>` : ""}${s.head ? `<table${big && s.head[0] === "코드" ? ' class="bk"' : ""}><thead><tr>${s.head.map((h, i) => `<th class="${i >= (s.numFrom ?? 1) && !rpTextCols(s).has(i) ? "" : "l"}">${esc(h)}</th>`).join("")}</tr></thead><tbody>${s.rows.map(r => `<tr class="${r.cls || ""}">${r.cells.map((c, i) => cell(c, i, s)).join("")}</tr>`).join("")}</tbody></table>` : ""}</section>`).join("");
   const sP = o.appr && o.seal === "pastor" ? Seal.tag("pastor", 12.5) : "";
   const appr = o.appr ? `<div class="rt"><table class="appr"><tr><th rowspan="2">결<br>재</th><th>담당자</th><th>재정부장</th><th>담임목사</th></tr><tr><td></td><td></td><td style="padding:0;vertical-align:middle">${sP}</td></tr></table></div>` : `<div class="rt v"><div class="when">작성일 ${fmtD(today())}</div></div>`;
   const css = `@page{size:A4 ${land ? "landscape" : "portrait"};margin:12mm 12mm 15mm;@bottom-left{content:"${esc(ch.name)} · ${esc(m.title)}";font-size:8pt;color:#8a94a8}@bottom-right{content:counter(page) " / " counter(pages);font-size:8pt;color:#8a94a8}}
@@ -2669,12 +2904,12 @@ h2{font-size:1.14em;margin:15px 0 6px;padding:1px 0 4px 10px;border-left:5px sol
 table{width:100%;border-collapse:collapse;font-size:calc(${fs}pt * ${tf});margin-bottom:8px}
 thead{display:table-header-group}tr{break-inside:avoid}
 th{background:#1f3a68;color:#fff;font-weight:600;padding:${(5 * sc).toFixed(1)}px 8px;text-align:right;white-space:nowrap}th.l{text-align:left}
-td{padding:${(4 * sc).toFixed(1)}px 8px;border-bottom:1px solid #dfe4ec;text-align:right;white-space:nowrap}td.l{text-align:left;white-space:normal}
+td{padding:${(4 * sc).toFixed(1)}px 8px;border-bottom:1px solid #dfe4ec;text-align:right;white-space:nowrap}table.bk{font-size:calc(${fs}pt * ${tf} * 1.1)}table.bk th:last-child,table.bk td:last-child{font-size:calc(10pt * ${sc} * ${tf})}td.l{text-align:left;white-space:normal}${big ? "td.l:first-child{white-space:nowrap}" : ""}
 tr.cat td{background:#f1f4fa;font-weight:700;border-bottom:1px solid #b9c3d6}
 tr.sum td{background:#e3eaf5;font-weight:700;border-top:1.5px solid #1f3a68;border-bottom:1.5px solid #1f3a68}
 .neg{color:#c0261c}.zero{color:#b4bccb}`;
   return `<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8"><title>${esc(m.title)}</title><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700&display=swap"><style>${css}</style></head><body><button class="pbtn" onclick="window.print()">인쇄 / PDF로 저장</button>
-<div class="hd"><div><div class="org">${esc(ch.name)}</div><h1>${esc(m.title)}</h1><div class="period">${esc((m.sub || "").replace(new RegExp(" · " + ch.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "$"), ""))}</div></div>${appr}</div><div class="${o.cols === 2 ? "cols2" : ""}">${secs}</div></body></html>`;
+<div class="hd"><div><div class="org">${esc(ch.name)}</div><h1>${esc(m.title)}</h1><div class="period">${esc((m.sub || "").replace(new RegExp(" · " + ch.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "$"), ""))}</div></div>${appr}</div><div class="${o.cols === 2 ? "cols2" : ""}">${secs}</div><script>(function(){var BIG=0;function fit(){document.querySelectorAll("table:not(.appr)").forEach(function(t){t.style.zoom="";var a=t.parentElement.clientWidth,w=t.getBoundingClientRect().width;if(BIG){var lo=0.5,hi=1.6;for(var i=0;i<14;i++){var m=(lo+hi)/2;t.style.zoom=m;if(t.getBoundingClientRect().width<=a+0.5)lo=m;else hi=m}t.style.zoom=(lo*0.99).toFixed(3)}else if(w>a+0.5)t.style.zoom=(a/w*0.995).toFixed(3)})}addEventListener("load",fit);if(document.fonts&&document.fonts.ready)document.fonts.ready.then(fit);addEventListener("beforeprint",fit)})()<\/script></body></html>`;
 }
 /* ===== PDF·구글 시트 내보내기 (인쇄 창의 버튼) ===== */
 const Exp = {
@@ -2725,16 +2960,28 @@ const Exp = {
     doc.setDrawColor(201, 209, 224); doc.setLineWidth(0.25); doc.line(M, hb, W - M, hb);
     /* 표 옵션 (한 곳에서 만들어 측정용·실제용이 같은 모양이 되게 한다) */
     const tableOpts = (D, sp, extra) => {
+      const w0 = () => { D.setFont("KR", "normal"); D.setFontSize(Fz); let mx = 0; sp.rows.forEach(r => { const s = String(r.cells[0] ?? ""), ind = (/^[ \u3000]+/.exec(s) || [""])[0].length, w = D.getTextWidth(s.replace(/^[ \u3000]+/, "")) * (r.cls ? 1.08 : 1) + 2 * PX + 1 + ind * 1.4; if (w > mx) mx = w; }); return mx; };
+      const PX = 2; let Fz = fs * tf * (big && sp.head[0] === "코드" ? 1.1 : 1); const labelW = () => { D.setFont("KR", "normal"); D.setFontSize(Fz); let mx = 0; sp.rows.forEach(r => { const s = String(r.cells[1] ?? ""), ind = (/^[ 　]+/.exec(s) || [""])[0].length, w = D.getTextWidth(s.replace(/^[ 　]+/, "")) * (r.cls ? 1.08 : 1) + 5 + ind * 1.4; if (w > mx) mx = w; }); return mx; };
       const nf = sp.numFrom ?? 1, tc = rpTextCols(sp), isNum = i => i >= nf && !tc.has(i);
+      { /* 숫자 칸이 줄바꿈되지 않도록, 표 폭에 맞춰 글자 크기를 필요한 만큼만 줄인다 */
+        const tw = cols === 2 ? (W - 2 * M - 6) / 2 : W - 2 * M, ncol = sp.head.length; D.setFontSize(Fz); let sum = 0;
+        for (let i = 0; i < ncol; i++) {
+          let mx = 0; const tx = (txt, bold) => { D.setFont("KR", bold ? "bold" : "normal"); const w = D.getTextWidth(String(txt)) * (bold ? 1.1 : 1); if (w > mx) mx = w; };
+          String(sp.head[i]).split(/\s+/).forEach(wd => tx(wd, true));
+          sp.rows.forEach(r => { const c = r.cells[i], s = typeof c === "number" ? (c === 0 ? "–" : won(c)) : String(c ?? ""); tx(s.replace(/^[ \u3000]+/, ""), !!r.cls); });
+          sum += sp.head[0] === "코드" && i === ncol - 1 && sp.head[i] === "비고" ? tw * (land ? 0.17 : 0.2) - 2 * PX : isNum(i) || i === 0 ? mx : Math.min(mx, 30 * k);
+        }
+        const room = tw - 2 * PX * ncol; if (sum > room && room > 0) Fz = Math.max(Fz * 0.5, Fz * room / sum * 0.97);
+      }
       return {
-        theme: "plain", rowPageBreak: "avoid",
-        styles: { font: "KR", fontSize: fs * tf, cellPadding: { top: 1.35 * k, bottom: 1.35 * k, left: 2, right: 2 }, textColor: INK, lineWidth: 0, valign: "middle", overflow: "linebreak" },
+        theme: "plain", rowPageBreak: "avoid", columnStyles: sp.head[0] === "코드" ? { 0: { cellWidth: "wrap" }, ...(land && cols === 1 ? { 1: { cellWidth: Math.min(labelW(), (W - 2 * M) * 0.4) } } : {}), ...(sp.head[sp.head.length - 1] === "비고" ? { [sp.head.length - 1]: { cellWidth: (cols === 2 ? (W - 2 * M - 6) / 2 : W - 2 * M) * (land ? 0.17 : 0.2), fontSize: 10 * sc * tf } } : {}) } : (big && !(sp.head[0] === "구분") ? { 0: { cellWidth: Math.min(w0(), (cols === 2 ? (W - 2 * M - 6) / 2 : W - 2 * M) * 0.32) } } : {}),
+        styles: { font: "KR", fontSize: Fz, cellPadding: { top: 1.35 * k, bottom: 1.35 * k, left: PX, right: PX }, textColor: INK, lineWidth: 0, valign: "middle", overflow: "linebreak" },
         headStyles: { fillColor: NAVY, textColor: [255, 255, 255], fontStyle: "bold" },
         head: [sp.head.map((h, i) => ({ content: String(h), styles: { halign: isNum(i) ? "right" : "left" } }))],
         body: sp.rows.map(r => r.cells.map((c, i) => {
           const num = isNum(i), st = { halign: num ? "right" : "left" };
           if (typeof c === "number") { if (c < 0) st.textColor = RED; else if (c === 0) st.textColor = ZERO; return { content: c === 0 ? "–" : won(c), styles: st }; }
-          const str = String(c ?? ""); if (!num) { const ind = (/^[ 　]+/.exec(str) || [""])[0].length; if (ind) st.cellPadding = { top: 1.35 * k, bottom: 1.35 * k, left: 2 + ind * 1.4, right: 2 }; return { content: str.replace(/^[ 　]+/, ""), styles: st }; }
+          const str = String(c ?? ""); if (!num) { const ind = (/^[ 　]+/.exec(str) || [""])[0].length; if (ind) st.cellPadding = { top: 1.35 * k, bottom: 1.35 * k, left: PX + ind * 1.4, right: PX }; return { content: str.replace(/^[ 　]+/, ""), styles: st }; }
           return { content: str, styles: st };
         })),
         didParseCell: d => {
@@ -2784,10 +3031,10 @@ const Exp = {
         const hH = headingH(s, cw), minH = hH + info.hh + (info.rh[0] || 0) + (info.rh[1] || 0);
         if (y + minH > bottom) next();
         y = heading(s, M + col * (cw + gap), y, cw);
-        let idx = 0; const n = s.rows.length;
+        let idx = 0, guard = 0; const n = s.rows.length;
         while (idx < n) {
           let take = 0, sum = info.hh; while (idx + take < n && y + sum + info.rh[idx + take] <= bottom) { sum += info.rh[idx + take]; take++; }
-          if (take === 0) { next(); continue; }
+          if (take === 0) { if (guard++ > 1) take = 1; else { next(); continue; } } else guard = 0;
           const x = M + col * (cw + gap), part = { ...s, rows: s.rows.slice(idx, idx + take) };
           doc.autoTable({ ...tableOpts(doc, part), columnStyles: colStyles, startY: y, tableWidth: cw, margin: { left: x, right: W - x - cw, top: y, bottom: 1 }, pageBreak: "avoid" });
           y = doc.lastAutoTable.finalY; idx += take;
@@ -2807,8 +3054,10 @@ const Exp = {
     const land0 = o.land == null ? rpMaxCols(m) > 7 : !!o.land;
     if (o.fit) {
       let best = null;
-      const cands = o.land == null ? [{ land: false, cols: 1 }, { land: true, cols: 1 }, { land: true, cols: 2 }] : o.land ? [{ land: true, cols: 1 }, { land: true, cols: 2 }] : [{ land: false, cols: 1 }];
+      const two = rpMaxCols(m) <= 6 ? [{ land: true, cols: 2 }] : [];
+      const cands = o.land == null ? [{ land: false, cols: 1 }, { land: true, cols: 1 }, ...two] : o.land ? [{ land: true, cols: 1 }, ...two] : [{ land: false, cols: 1 }];
       for (const c of cands) {
+        await new Promise(r => setTimeout(r, 0));
         const b = sc => this.build(m, { ...o, land: c.land, cols: c.cols, scale: sc });
         let d = await b(this.MIN); if (d.getNumberOfPages() > 2) continue;
         let lo = this.MIN, bd = d, bs = lo; const top = await b(1);
@@ -3014,17 +3263,17 @@ function RPexport(kind, mm) {
     foot: `<span class="hint" style="margin-right:auto">미리보기는 대략적인 모양입니다. 쪽 나눔은 저장되는 PDF 기준입니다.</span><button class="btn" id="rv-sh">구글 시트로 보내기</button><button class="btn pri" id="rv-pdf">PDF로 저장 · 인쇄</button>`,
   });
   if (Store.mode === "dept") { const sh = $("#rv-sh", ov), sl = $("#rv-sl", ov); if (sh) sh.style.display = "none"; if (sl) (sl.closest("label") || sl).style.display = "none"; }
-  const opts = () => ({ big: RP.big, land: RPV.land, appr: RPV.appr, fit: RPV.fit, seal: RPV.seal });
+  const opts = () => ({ big: RP.big, land: RPV.land, appr: RPV.appr, fit: RPV.fit && !RP.big, seal: RPV.seal });
   const msg = (t, link) => { const e = $("#rv-msg", ov); if (!e) return; e.innerHTML = esc(t) + (link ? ` <a href="${esc(link)}" target="_blank" rel="noopener" style="color:var(--blue,#007aff);font-weight:600">열기</a>` : ""); };
   const ALL = ["#rv-sh", "#rv-pdf"], busy = on => ALL.forEach(id => { const b = $(id, ov); if (b) b.disabled = on; });
-  let plan = null, tok = 0;
+  let plan = null, tok = 0; const pcache = {};
   const draw = async () => {
     const my = ++tok; busy(true); msg("미리보기를 만드는 중…");
     if (RPV.seal !== "none") { try { await Seal.load(); } catch (e) { } if (!Seal.img("pastor")) { RPV.seal = "none"; msg("담임목사 직인이 등록되어 있지 않습니다 (설정 › 직인)"); } }
     $$("#rv-fs button", ov).forEach(b => b.classList.toggle("on", (b.dataset.v === "1") === !!RP.big));
     $$("#rv-fit button", ov).forEach(b => b.classList.toggle("on", (b.dataset.v === "1") === !!RPV.fit));
     $("#rv-ap", ov).checked = !!RPV.appr; $("#rv-sl", ov).checked = RPV.seal === "pastor";
-    let r; try { r = await Exp.pdf(m, opts()); } catch (e) { if (my === tok) { msg("미리보기 실패: " + ((e && e.message) || e)); busy(false); } return; }
+    let r; try { const ck = JSON.stringify(opts()); r = pcache[ck] || (pcache[ck] = await Exp.pdf(m, opts())); } catch (e) { if (my === tok) { msg("미리보기 실패: " + ((e && e.message) || e)); busy(false); } return; }
     if (my !== tok) return; plan = r;
     $$("#rv-or button", ov).forEach(b => b.classList.toggle("on", (b.dataset.v === "l") === r.land));
     $("#rv", ov).srcdoc = reportDoc(m, { big: RP.big, land: r.land, appr: RPV.appr, scale: r.scale, cols: r.cols, seal: RPV.seal }).replace("</style>", ".pbtn{display:none!important}</style>");
